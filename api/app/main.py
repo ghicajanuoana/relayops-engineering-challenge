@@ -1,12 +1,24 @@
-from fastapi import FastAPI, HTTPException, Response
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from psycopg.types.json import Jsonb
 
 from .db import get_conn
 from .models import EventIn
+from .observability import RequestIDMiddleware
 
 app = FastAPI(title="RelayOps API")
+app.add_middleware(RequestIDMiddleware)
+
+
+@app.exception_handler(Exception)
+async def unexpected_error(request: Request, exc: Exception):
+    # Unhandled-error responses are sent outside the user middleware stack.
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Internal Server Error"},
+        headers={"X-Request-ID": request.state.request_id},
+    )
 
 
 @app.exception_handler(RequestValidationError)
@@ -21,6 +33,32 @@ async def validation_error(request, exc: RequestValidationError):
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+@app.get("/metrics")
+def metrics():
+    with get_conn() as conn:
+        counts = conn.execute("""
+            SELECT count(*) FILTER (WHERE status='pending') AS pending,
+                   count(*) FILTER (WHERE status='processing') AS processing,
+                   count(*) FILTER (WHERE status='delivered') AS delivered,
+                   count(*) FILTER (WHERE status='failed') AS failed,
+                   (SELECT count(*) FROM delivery_attempts) AS delivery_attempts_total
+            FROM events
+        """).fetchone()
+    lines = [
+        "# HELP relayops_events Stored events by status.",
+        "# TYPE relayops_events gauge",
+        *[f'relayops_events{{status="{status}"}} {counts[status]}'
+          for status in ("pending", "processing", "delivered", "failed")],
+        "# HELP relayops_delivery_attempts_total Recorded delivery attempts.",
+        "# TYPE relayops_delivery_attempts_total counter",
+        f'relayops_delivery_attempts_total {counts["delivery_attempts_total"]}',
+    ]
+    return Response(
+        content="\n".join(lines) + "\n",
+        headers={"Content-Type": "text/plain; version=0.0.4; charset=utf-8"},
+    )
 
 
 @app.post("/events", status_code=202)

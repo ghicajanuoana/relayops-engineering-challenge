@@ -23,6 +23,9 @@
 | 17 | Concurrent worker ownership | A two-worker test reproduced two webhook deliveries for one event; one worker then raised `UniqueViolation` on the attempt-history constraint. | Workers selected pending rows without holding an exclusive claim through delivery. | `fetch_pending()` and `process_pending()` in `worker/worker.py` now use `FOR UPDATE SKIP LOCKED` inside a transaction covering one event's delivery and recording. |
 | 18 | In-flight crash recovery | Inspection found no exclusive in-flight ownership; previous recovery tests covered only already-scheduled retries. | Selection and outcome recording were separate transactions, and the delivery crash window was untested. | `worker/worker.py` holds a transactional row lock until commit. A crash rolls back unfinished writes and releases ownership; `tests/test_worker_reliability.py` verifies SIGKILL recovery and allowed redelivery after remote success. |
 | 19 | Worker shutdown | Inspection found no graceful SIGTERM handling and shell-form Docker startup. | The polling loop had no stop signal; the shell command did not launch Python directly as the container process. | `run()` in `worker/worker.py` handles SIGTERM/SIGINT, finishes the current attempt, and stops claiming work. `worker/Dockerfile` uses exec-form CMD. Process and container tests verified clean exit. |
+| 20 | Request tracing | The baseline gateway health response had no `X-Request-ID`; inspection found no request-ID logging or propagation. | Nginx and FastAPI had no shared request-ID handling. | `infrastructure/nginx.conf` generates or preserves IDs, forwards them, and adds them to every response. New `api/app/observability.py` and changes in `api/app/main.py` return and log IDs, including application failures. |
+| 21 | Prometheus metrics | Baseline `GET /metrics` returned `404`. | The endpoint was missing. | `api/app/main.py` now returns all four event-status gauges and the recorded delivery-attempt counter in Prometheus text format. Tests cover empty and populated databases. |
+| 22 | PostgreSQL host exposure | `docker compose port db 5432` returned `127.0.0.1:64438`. | The automatically loaded override published PostgreSQL outside its container network to the host. | Removed port publishing from `docker-compose.override.yml`. Runtime inspection confirmed no host binding; API and worker database connections still succeeded. |
 
 ## 2. Networking Diagnosis
 
@@ -37,6 +40,25 @@
 - Final Python probes in API and both worker replicas verified database DNS and `SELECT 1`; worker probes also verified database TCP connectivity, receiver DNS resolving to its container address, and receiver `/health` returning `200`.
 - Host `curl.exe` probes returned `200` for `http://localhost:8080/health` and `http://localhost:9000/health`. Final `docker compose ps -a` showed all services running and PostgreSQL healthy.
 - Receiver `/received` inspection confirmed the existing workers reached `/webhook`, but their requests returned `401` with `signature_valid=false`. The signature bug remains unfixed; connectivity verification does not establish successful delivery. Database localhost port publishing was also left unchanged.
+
+**Step 7:** Rechecked existing behavior before changing configuration, then verified database isolation and tracing:
+
+- `docker compose exec -T gateway nginx -t` passed. `docker compose exec -T gateway sh -c 'nslookup api; wget -S -O - http://api:8000/health'` resolved the API and returned `200`. Python probes through `docker compose exec -T api python -` confirmed gateway `/health` returned `200` and a 1 MiB payload received `202` through Nginx, then `200` with unchanged content on GET. Existing forwarding, body limit, and health behavior were retained.
+- `docker compose port db 5432` identified the localhost binding above. After its removal, `docker compose config --format json` had no database ports. Runtime inspection used:
+
+```powershell
+$dbContainer = docker compose ps -q db
+docker inspect --format '{{json .HostConfig.PortBindings}} {{json .NetworkSettings.Ports}}' $dbContainer
+```
+
+- Inspection returned `{}` and `{"5432/tcp":null}`: PostgreSQL remained exposed inside its container without host publishing. A host Python `socket.create_connection` probe to the former port timed out; it did not establish a connection.
+- Python scripts through `docker compose exec -T api python -` and `docker compose run --rm --no-deps -T worker python -` verified `socket.gethostbyname`, TCP connections to `db:5432`, and PostgreSQL `SELECT 1`. The worker-network probe also resolved and connected to `api:8000` and `receiver:9000`, with receiver `/health` returning `200`. The API could reach gateway `/health` with `200`.
+- `docker compose exec -T gateway nslookup db` returned `NXDOMAIN`. A Python DNS probe through `docker compose exec -T receiver python -` raised `socket.gaierror` for `db`, confirming that the database name was not resolvable from the receiver network.
+- Sent client ID `step7-provided-log-check` and a request without an ID through the gateway. Responses contained one ID each; Nginx and API logs contained the same provided and generated IDs. Read the matching raw log lines with:
+
+```powershell
+docker compose logs --since 3m api gateway | Select-String -Pattern 'step7-provided-log-check|545382448a23a1f733e911b0215c3511' | ForEach-Object { $_.Line }
+```
 
 ## 3. Technical Decisions
 
@@ -66,6 +88,11 @@
 - **Step 6 delivery guarantee:** PostgreSQL cannot atomically commit a transaction with an external HTTP receiver. If the receiver accepts a request and the worker crashes before committing, recovery sends it again. This preserves at-least-once recovery and permits duplicates in that failure window. The three-attempt limit applies to recorded attempts; an aborted transaction can leave an HTTP request without a committed history row. Exactly-once delivery is not claimed.
 - **Step 6 trade-off:** Holding a transaction open across HTTP occupies a database connection and row lock during the bounded five-second request plus database work. This costs database resources compared with short claim transactions, but gives automatic rollback-based recovery without lease expiry or stale ownership. Locks cover one event only, and competing workers skip them.
 - **Step 6 shutdown:** SIGTERM/SIGINT sets an asynchronous stop event without cancelling the active delivery. The worker records that attempt's success, failure, or timeout, then takes no further work and closes its connections. Idle polling waits on the stop event and wakes immediately. Exec-form Docker CMD lets Python receive the container signal directly.
+
+- **Step 7 request IDs:** Nginx maps an absent/empty client ID to `$request_id` and otherwise preserves it. `proxy_set_header` forwards that value to FastAPI; `add_header ... always` returns it even on gateway errors. Nginx hides the upstream copy to avoid duplicate headers. FastAPI middleware preserves incoming IDs or generates a UUID hex value for direct requests, stores it in request state, and adds the response header. Its unhandled-error handler also returns the ID because those responses are generated outside the user middleware stack.
+- **Step 7 logs:** Nginx access logs and API request logs use JSON with request ID, method, path, and status; Nginx also includes upstream status. API logs use the existing Uvicorn logger and record server failures at error level. Worker logging and delivery behavior were unchanged.
+- **Step 7 metrics:** `/metrics` uses one PostgreSQL statement for a consistent snapshot, counts stored events by status, and counts delivery-history rows. It emits all four status samples, including zeros, with Prometheus HELP/TYPE lines and `text/plain; version=0.0.4; charset=utf-8`. These reflect committed database states; Step 6's in-flight locks do not introduce a committed `processing` state. `/health` remains the existing database-independent liveness endpoint.
+- **Step 7 isolation:** Removed only the override's PostgreSQL port publication. API and workers continue using `db:5432` on the existing backend network; gateway and receiver remain on separate networks without database DNS access. The database volume and schema were retained. The existing 2 MiB Nginx body limit already accommodates a 1 MiB payload plus its JSON envelope and was not changed.
 
 ## 4. Starting and Verifying the System
 
@@ -191,6 +218,33 @@ docker compose ps worker
 - Both containers reported `exit=0`; both logs included `shutdown requested; finishing current attempt` and `worker stopped`. Final Compose output showed two workers running.
 - `git diff --check` passed. Step 6 changed only `worker/worker.py`, `worker/Dockerfile`, and the new `tests/test_worker_reliability.py`; API, Mock Receiver, schema, and solution documentation were unchanged during implementation.
 
+**Step 7:** Recreated the database without host publishing, rebuilt the API, validated/reloaded Nginx, and ran all non-smoke tests with Compose workers stopped:
+
+```powershell
+docker compose stop worker
+docker compose up --build -d db api
+docker compose exec -T gateway nginx -t
+docker compose exec -T gateway nginx -s reload
+docker compose run --rm --no-deps -v "${PWD}:/workspace" -w /workspace -e PYTHONDONTWRITEBYTECODE=1 -e RELAYOPS_TEST_DATABASE_URL=postgresql://relayops:relayops@db:5432/relayops -e RELAYOPS_BASE_URL=http://gateway api sh -c 'pip install -q -r tests/requirements.txt && python -m pytest tests --ignore=tests/test_smoke.py -q -ra --tb=short -p no:cacheprovider'
+```
+
+- **Regression result:** 155 passed in 57.91 seconds, exit code 0, no failures or skips. Includes all 127 previous regressions and 28 new tests in `tests/test_observability_unit.py`, `tests/test_observability_integration.py`, and `tests/test_gateway_http.py`. One third-party Starlette/AnyIO deprecation warning was reported.
+- **Request-ID coverage:** Generated and client-provided IDs were tested on gateway `200`, `202`, `409`, `422`, `404`, `405`, and gateway-generated `413` responses. Tests assert exactly one header and distinct generated IDs across requests. Direct API tests verify matching log entries and IDs on unhandled `500` responses. End-to-end log inspection is recorded in Section 2.
+- **Metrics coverage:** Verified all-zero samples for an empty database. Seeded PostgreSQL tests returned pending `2`, processing `1`, delivered `1`, failed `1`, and delivery attempts `3`, with correct text format and no mutation during repeated scrapes. The live gateway returned `/metrics` with `200` and the required content type. Existing 1 MiB payload regression tests also passed.
+- **Gateway failure coverage:** After `docker compose stop api`, host Python requests to gateway `/health` using `urllib.request.urlopen` with `timeout=15` received actual `504` responses. Both missing-ID and provided-ID requests returned exactly one correct `X-Request-ID`. `docker compose start api` and Nginx reload restored gateway `/health` to `200`.
+- Database DNS/TCP/query checks, host-port removal, and network isolation observations are recorded in Section 2. No schema migration or worker changes were required.
+
+Restored two workers and ran the existing delivery smoke tests:
+
+```powershell
+docker compose up -d --no-build --scale worker=2 worker
+docker compose run --rm --no-deps -v "${PWD}:/workspace" -w /workspace -e PYTHONDONTWRITEBYTECODE=1 -e RELAYOPS_BASE_URL=http://api:8000 -e RELAYOPS_RECEIVER_URL=http://receiver:9000 worker sh -c 'pip install -q -r tests/requirements.txt && python -m pytest tests/test_smoke.py -v -ra --tb=short -p no:cacheprovider'
+docker compose ps
+```
+
+- **Smoke result:** 2 passed in 0.64 seconds, exit code 0, no failures or skips. Final Compose output showed all services running, PostgreSQL healthy with only internal `5432/tcp`, and two worker replicas.
+- `git diff --check` passed. Step 7 changed Nginx configuration, the Compose override, API tracing/metrics, and three new test files. Worker code, Mock Receiver, schema, and solution documentation were unchanged during implementation.
+
 ## 5. AI Tools Used
 
 - Used Codex to inspect configuration, reproduce networking failures, edit four configuration files, and run container DNS, HTTP, database, and restart checks. Verified changes against actual command output and reviewed the diff; `git diff --check` passed. No API or worker source functionality was changed.
@@ -203,5 +257,8 @@ docker compose ps worker
 - **Step 5 verification:** Codex identified that the prior HTTPX phase timeout did not enforce a total five-second deadline and added a delayed-response test with phase timeouts disabled. No new implementation or test mistake was identified during Step 5.
 - **Step 6:** Codex wrote a real-process concurrency test that reproduced duplicate delivery before implementation, then added transactional row ownership, rollback-based recovery, signal handling, and direct Docker startup. Verification used real PostgreSQL and HTTP, SIGKILL at controlled delivery/commit boundaries, SIGTERM during active and idle work, all 127 regressions, and two smoke tests with two Compose workers. Docker exit codes and logs independently confirmed clean shutdown.
 - **Step 6 mistakes:** No new AI implementation or test mistake was identified; the initial test failure intentionally reproduced the existing concurrency race.
+- **Step 7:** Codex first verified the existing proxy, 1 MiB payload round trip, and health endpoint, then added tracing, metrics, database isolation, and 28 tests. Verification used 155 passing regressions, two passing smoke tests, actual service logs, live gateway failures, runtime port inspection, and Docker DNS/TCP/database probes. Existing worker and receiver behavior was preserved.
+- **Step 7 timeout mistake:** The initial upstream-failure probe used a five-second client timeout, matching Nginx's connection timeout, and expected `502`. It timed out before reading a gateway response. Codex restored the API, reran with a 15-second client timeout and accepted upstream-error codes `502`/`504`, then verified the actual `504` responses and their IDs. No application or Nginx timeout change was needed.
+- **Step 7 log-check correction:** A diagnostic matcher initially missed gateway IDs because PowerShell formatted matching lines across multiple display lines. Reading each match's raw `Line` property confirmed both provided and generated IDs in the gateway and API logs.
 
 ## 6. Future Improvements
