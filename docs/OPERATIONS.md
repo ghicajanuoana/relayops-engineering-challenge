@@ -66,8 +66,10 @@ The test runner returns pytest's exit code and writes `test-results/*.xml`.
 GitHub Actions runs these phases on pushes and pull requests with generated,
 isolated credentials, health-gated startup, failure logs, JUnit artifact upload,
 and unconditional container cleanup. It needs no repository secrets or cloud
-account. Its checkout, artifact upload, and hosted runner execution still need
-verification in a real GitHub run.
+account. Push-triggered CI, checkout, regression/smoke gates, artifact upload, and
+cleanup succeeded in [run 40532562527](https://github.com/ghicajanuoana/relayops-engineering-challenge/actions/runs/40532562527)
+for commit `96c16b8`. Run CI again after committing later changes; manual dispatch
+is configured but has not been exercised during this verification.
 
 ## Troubleshooting and data preservation
 

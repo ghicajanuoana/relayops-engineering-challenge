@@ -20,7 +20,11 @@ class EventIn(BaseModel):
     @classmethod
     def validate_json_payload(cls, value: dict[str, Any]) -> dict[str, Any]:
         # PostgreSQL JSONB rejects non-finite numbers and Unicode nulls.
-        raw = json.dumps(value, allow_nan=False)
+        raw = json.dumps(value, allow_nan=False, ensure_ascii=False)
+        try:
+            raw.encode("utf-8")
+        except UnicodeEncodeError:
+            raise ValueError("payload strings must contain valid Unicode scalar values") from None
         if "\\u0000" in raw.lower():
             # Inspect decoded strings so a literal backslash-u0000 is allowed.
             def has_null(item):

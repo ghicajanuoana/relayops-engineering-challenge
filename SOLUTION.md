@@ -1,5 +1,7 @@
 # SOLUTION
 
+Steps 2–8 below retain their verified results and limitations at the time of each step. Step 9 records the final state and supersedes historical statements that hosted CI was unverified or later functionality was deferred.
+
 ## 1. Identified Problems and Solutions
 
 | # | Component | Symptom | Cause | Solution |
@@ -33,6 +35,8 @@
 | 27 | Reproducibility | Inspection found floating image tags and unpinned transitive Python dependencies. | Top-level requirement pins did not fix the complete runtime environment. | Dockerfiles and Compose pin image digests; service/test `requirements.lock` files pin installed versions. `tests/Dockerfile` provides a consistent test environment, and `.dockerignore` excludes private configuration. |
 | 28 | CI automation | `.github/workflows/ci.yml` only printed a TODO. | No automated startup, test gates, reports, or cleanup existed. | The workflow now runs health-gated dependency startup, regressions, two-worker smoke tests, failure diagnostics, JUnit upload, and volume-preserving cleanup using `tests/run_tests.py`. |
 
+| 29 | Payload Unicode validation | Step 9 reproduced `500` through the gateway for an unpaired Unicode surrogate in a nested payload. | JSON serialization escaped the invalid scalar, allowing it past validation into PostgreSQL JSONB handling. | `api/app/models.py` validates UTF-8 encoding before database access; malformed payloads return `422`. `tests/test_api_unit.py` adds three invalid cases; `tests/test_api_http.py` verifies valid surrogate pairs and literal escape strings remain accepted. |
+
 ## 2. Networking Diagnosis
 
 - Inspected Compose, its automatically loaded override, Dockerfiles, and Nginx configuration. Existing shared networks and service ports matched the intended communication paths; no network topology changes were needed.
@@ -65,6 +69,8 @@ docker inspect --format '{{json .HostConfig.PortBindings}} {{json .NetworkSettin
 ```powershell
 docker compose logs --since 3m api gateway | Select-String -Pattern 'step7-provided-log-check|545382448a23a1f733e911b0215c3511' | ForEach-Object { $_.Line }
 ```
+
+**Step 9:** `docker compose config --quiet` and `docker compose exec -T gateway nginx -t` passed. Python `socket.gethostbyname()` / `socket.create_connection(..., 3)` probes run with `docker compose exec -T api python -c ...` and `docker compose exec -T --index 1 worker python -c ...` confirmed API→`db:5432` and worker→`db:5432` / `receiver:9000` DNS and TCP access. Database DNS resolved to `172.20.0.2`; receiver resolved to `172.19.0.2`. `docker inspect relayops-engineering-challenge-db-1 --format '{{json .NetworkSettings.Ports}}'` returned `{"5432/tcp":null}`, confirming no host publication. `docker compose ps` showed all six runtime containers healthy, including two workers. The regression suite reverified the 1 MiB payload round trip, request IDs, health, metrics, and network isolation.
 
 ## 3. Technical Decisions
 
@@ -106,6 +112,10 @@ docker compose logs --since 3m api gateway | Select-String -Pattern 'step7-provi
 - **Step 8 logging:** API formatting retains request IDs and redacts known credentials in messages and tracebacks. Workers log event IDs, PID, attempt, status, and exception type without receiver URLs or raw network exception text. Receiver access logging is disabled to avoid query-string logging. Runtime Docker logs rotate at 10 MB with three files per container; output is unbuffered.
 - **Step 8 reproducibility:** Python, PostgreSQL, and Nginx base images are pinned by digest. API, worker, receiver, and test dependency locks capture exact installed package versions while retaining source requirements. The test-profile image includes application/schema/test sources and the locked test environment, avoiding ad hoc package installation during CI test execution. Startup, upgrades, and verification are documented in `docs/OPERATIONS.md` and linked from README.
 - **Step 8 CI:** Pushes and pull requests run on an Ubuntu runner with read-only repository permissions and pinned checkout/artifact actions. CI generates isolated credentials, starts healthy database/API/gateway/receiver services, and runs regressions with Compose workers absent. It then starts two workers and runs smoke tests. `tests/run_tests.py` constructs connection settings in the process environment, returns pytest's exit code, and writes JUnit XML. Failures collect diagnostics; report upload and `docker compose down` run unconditionally without deleting volumes. No repository secrets or cloud deployment are required.
+
+**Step 9:** Reject unpaired Unicode surrogates before database access while retaining valid Unicode and literal backslash escapes. No API response shapes or receiver contract changed. Strengthened the existing smoke test to require a valid signature, matching webhook body, HTTP `200`, and committed delivery history; it waits for both receipt and committed status to avoid observing the interval between HTTP acceptance and database commit.
+
+Final operational limits remain explicit: initial startup requires private configuration; old volumes need any missing numbered migrations applied once. In-flight delivery holds a database transaction/row lock, so the committed `processing` gauge normally remains zero. A crash after remote acceptance can cause a duplicate; the three-attempt limit counts committed history, not uncommitted HTTP calls. Docker health status alone does not restart an unhealthy process.
 
 ## 4. Starting and Verifying the System
 
@@ -303,6 +313,49 @@ docker compose --env-file .env.step8-fresh -p relayops-step8-fresh up --build --
 - **GitHub limitation:** GitHub Actions has not been executed on GitHub. Hosted runner behavior, checkout, secret masking, artifact upload, and displayed job status still require a real push/PR workflow run. Local checks do not establish hosted CI success.
 - Final state: the main installation has six healthy runtime containers, including exactly two workers; validation-project data remains in its retained volume. API/worker functional contracts, receiver API, and existing application data were preserved. `SOLUTION.md` was not changed during implementation.
 
+**Step 9 — final verification (27 October 2026):** Reviewed every contract and task in README against source, configuration, and executed tests. Reused the configured existing volume; no volume was deleted. Commands executed:
+
+```bash
+docker compose config --quiet
+docker compose up --build -d --wait --wait-timeout 120
+docker compose stop worker
+docker compose --profile test run --build --rm tests regression
+# After the Unicode validation fix:
+docker compose up --build -d --wait --wait-timeout 120 api gateway
+docker compose exec -T gateway nginx -t
+docker compose exec -T gateway nginx -s reload
+docker compose --profile test run --build --rm tests regression
+docker compose up --build -d --wait --wait-timeout 120 worker
+docker compose --profile test run --build --rm tests smoke
+docker compose ps
+```
+
+- Baseline: **166 passed**. Final regression: **170 passed, 0 failed, 0 skipped**, 58.66 seconds. Final rebuilt-image smoke run: **2 passed, 0 failed, 0 skipped**, 1.10 seconds. JUnit reports are in ignored `test-results/`. The regression run emits one third-party Starlette/AnyIO deprecation warning.
+- Reexecuted real-PostgreSQL/process tests cover simultaneous workers, queue sharing, lock skipping, worker termination, recovery after remote success, persisted retry restart, and SIGTERM during idle, successful delivery, and bounded timeout. Graceful subprocess shutdown assertions require exit code `0`.
+- Additional host-Python `urllib.request` probes through `localhost:8080`, using the unchanged receiver's `/control` and `/received`, observed `202` creation, `200` identical replay, `409` changed content; `[503, 503, 200]` delivery history with three valid signatures and retry gaps **1.011 / 2.009 seconds**; permanent `400` became failed after one attempt. Twelve concurrent submissions produced one `202`, eleven `200`, and one signed delivery with both workers running. The original malformed-Unicode request now returns `422`. Receiver controls were reset afterward.
+- GitHub API run/job/log inspection confirmed [CI run 40532562527](https://github.com/ghicajanuoana/relayops-engineering-challenge/actions/runs/40532562527) completed successfully for push to `main`, commit `96c16b8dfb6b239e78d804b30f8db273ffe44fa6`: **166 regression tests + 2 smoke tests passed**. Startup, two-worker startup, report upload, and cleanup steps succeeded. The workflow supports `push` (including `main`), `pull_request`, and `workflow_dispatch`. Manual dispatch was not exercised. This hosted run predates the local Step 9 changes; commit/push those changes and confirm their new run before submission.
+- Audited the current Git-tracked files using `git ls-files` and a Python scan: no private environment files, private-key files/token markers, or occurrences of the active generated database/HMAC secrets were found. `git check-ignore .env .env.step8-fresh test-results/regression.xml` confirmed private configurations/reports are ignored. This is a working-tree audit, not a claim about all Git history.
+
+Final challenge checklist:
+
+| Requirement | Final status and evidence |
+|---|---|
+| POST persistence, validation, `202/200/409/422`; GET history / `404` | Complete; API unit, PostgreSQL integration, HTTP, and concurrent idempotency tests passed. |
+| Payloads up to 1 MB through Nginx | Complete; 1 MiB payload round-trip regression passed. |
+| `/health`, Prometheus metrics with four statuses and attempt total | Complete; endpoint/content regressions passed. |
+| Request IDs generated/preserved, propagated, returned on errors, logged | Complete; request-ID/logging regressions passed. |
+| Configured webhook destination, exact contract body, raw-byte HMAC, invalid signature `401` | Complete; worker/receiver integration and strengthened smoke tests passed. |
+| Only `2xx` delivered; every recorded outcome has status or network error | Complete; success/error and atomic-history tests passed. |
+| Network/timeout/`429`/`5xx` retries; five-second deadline; backoff/Retry-After; maximum three recorded attempts | Complete; unit/integration tests and live retry probes passed. |
+| Permanent errors fail immediately; exhausted retries fail | Complete; classification/attempt-limit tests and live `400` probe passed. |
+| Persistent retry scheduling, restart recovery, other work during retry wait | Complete; real database/process tests passed. |
+| At least two workers, exclusive processing, crash recovery, at-least-once semantics, SIGTERM | Complete; concurrency/crash/shutdown tests passed; two healthy Compose workers observed. |
+| Nginx forwarding, Docker DNS/TCP, PostgreSQL not host-published | Complete; runtime diagnostics and regression checks passed. |
+| Compose startup, health checks, environment secrets, useful logs, reproducible dependencies | Complete after documented configuration bootstrap; fresh/existing-volume evidence retained in Step 8. |
+| GitHub Actions test pipeline | Confirmed successful for the baseline commit; final Step 9 commit still needs its own hosted run. |
+| Technical report, AI usage, future improvements | Completed in these six sections. |
+| Submission CV and final fork/commit link | Pending user submission: `candidate/CV.pdf` is absent; final changes must be committed/pushed and the final link supplied. |
+
 ## 5. AI Tools Used
 
 - Used Codex to inspect configuration, reproduce networking failures, edit four configuration files, and run container DNS, HTTP, database, and restart checks. Verified changes against actual command output and reviewed the diff; `git diff --check` passed. No API or worker source functionality was changed.
@@ -322,4 +375,15 @@ docker compose --env-file .env.step8-fresh -p relayops-step8-fresh up --build --
 - **Step 8 configuration-order mistake:** Codex initially issued a Compose stop command before creating `.env`. Required-variable validation rejected the command. It generated configuration, synchronized the role password, and reran the stop/start sequence successfully; checksum checks confirmed data preservation.
 - **Step 8 diagnostic correction:** The first image-digest command used a quoted Go-template separator that PowerShell did not pass correctly; Docker reported a template parsing error. Replaced it with `{{json .RepoDigests}}` and used the returned digests. Code inspection also prompted atomic heartbeat writes, followed by the final full regression rerun.
 
+- **Step 9:** Codex reviewed the README contracts, reran all automated tests, inspected the actual GitHub run/jobs/logs, checked tracked files for active secrets, and exercised the live gateway/receiver with two workers. It fixed only the reproduced Unicode validation gap and strengthened existing smoke assertions; `docs/OPERATIONS.md` now records confirmed hosted CI with its commit scope. Verification used 170 passing regressions, two passing smoke tests, live retry/HMAC/idempotency probes, and Docker diagnostics. The earlier validator's omission of unpaired surrogates was detected by a real `500` response and corrected with regression coverage.
+- **Step 9 diagnostic mistake:** A live-check script assigned an event dictionary to `concurrent`, shadowing the imported module and raising `AttributeError` before the concurrent-request probe. Codex changed the script to import `ThreadPoolExecutor` directly and reran the affected probe successfully. No application change was required for that mistake.
+
 ## 6. Future Improvements
+
+- Add versioned migration tracking and automated upgrade checks so existing volumes do not require manual selection of missing SQL files.
+- Introduce bounded database connection pools and benchmark queue/index behavior under sustained load. The current transaction-per-delivery approach retains a connection and row lock throughout the bounded HTTP request; a lease design would need careful expiry/fencing and duplicate-delivery analysis.
+- Add delivery-latency, retry-delay, queue-age, and worker-health metrics with dashboards/alerts. Existing metrics expose committed event counts and attempt totals, rather than in-flight progress or latency distributions.
+- Use separate least-privilege application/database roles, managed secret rotation, gateway TLS/authentication, and restrict receiver diagnostic/control endpoints before any production exposure.
+- Add a dependency/image vulnerability scan and an automated, reviewed update process for pinned locks/digests. Resolve the upstream test deprecation warning during compatible dependency updates.
+- Add longer fault/soak tests for database/network outages and container replacement, including gateway DNS refresh after an API address changes. Define retention/archival for event/history tables and receiver diagnostic records as data volume grows.
+- Document receiver-side deduplication for real integrations: at-least-once delivery intentionally permits duplicates after a crash between remote acceptance and local commit.

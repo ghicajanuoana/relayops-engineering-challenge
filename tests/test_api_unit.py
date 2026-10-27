@@ -10,6 +10,9 @@ from app.main import app
     '{"event_id":"evt","type":"test","payload":{"value":NaN}}',
     '{"event_id":"evt","type":"test","payload":{"value":Infinity}}',
     '{"event_id":"evt","type":"test","payload":{"value":"\\u0000"}}',
+    '{"event_id":"evt","type":"test","payload":{"value":"\\ud800"}}',
+    '{"event_id":"evt","type":"test","payload":{"\\ud800":1}}',
+    '{"event_id":"evt","type":"test","payload":{"nested":["\\udfff"]}}',
 ])
 def test_invalid_request_never_opens_database(monkeypatch, raw):
     def unexpected_connection():

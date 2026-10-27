@@ -76,3 +76,14 @@ def test_http_large_payload(live_client, live_event):
     body = {**live_event, "payload": {"data": "x" * (1048576 - 11)}}
     assert live_client.post("/events", json=body).status_code == 202
     assert live_client.get("/events/" + live_event["event_id"]).json()["payload"] == body["payload"]
+
+
+def test_http_valid_unicode_pair_and_literal_escape(live_client, live_event):
+    raw = (
+        '{"event_id":"' + live_event["event_id"] + '","type":"test",'
+        '"payload":{"emoji":"\\ud83d\\ude00","literal":"\\\\ud800"}}'
+    )
+    response = live_client.post("/events", content=raw, headers={"Content-Type": "application/json"})
+    assert response.status_code == 202
+    saved = live_client.get("/events/" + live_event["event_id"]).json()
+    assert saved["payload"] == {"emoji": "😀", "literal": r"\ud800"}
