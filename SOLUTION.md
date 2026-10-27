@@ -422,3 +422,11 @@ docker compose --profile test run --rm tests smoke
 - Add longer fault/soak tests for database/network outages and container replacement, including gateway DNS refresh after an API address changes. Define retention/archival for event/history tables and receiver diagnostic records as data volume grows.
 - Document receiver-side deduplication for real integrations: at-least-once delivery intentionally permits duplicates after a crash between remote acceptance and local commit.
 - Automate encrypted backup/restore verification for database and credential volumes together; current documentation requires preserving both, but backup automation is not implemented.
+- Dead Letter Queue (DLQ): Introduce a separate queue for permanently failed events, allowing easier investigation and management.
+- Manual Retry: Add an authenticated endpoint that allows administrators to manually retry failed events.
+- Event Management Dashboard: Develop a simple frontend to monitor events, their statuses, and delivery history.
+- Event Filtering: Allow users to search and filter events by status, type, or date.
+- Email Notifications: Notify administrators when an event permanently fails.
+- Configurable Retry Policy: Make retry limits and backoff intervals configurable through environment variables.
+- Event Expiration: Automatically archive or remove old events to prevent excessive database growth.
+- Rate Limiting: Limit the number of API requests per client to prevent abuse and protect system performance.
