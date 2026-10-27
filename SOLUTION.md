@@ -20,6 +20,9 @@
 | 14 | Temporary delivery failures | Step 4 intentionally marked temporary failures failed after one attempt. | Retry classification, backoff, and `Retry-After` handling were deferred. | Step 5 adds these in `worker/worker.py`: retry network errors, timeouts, `429`, and `5xx`; fail permanent errors immediately; stop after three recorded attempts. |
 | 15 | HTTP attempt deadline | Inspection found the five-second HTTPX timeout limited individual network phases, not total request duration. | No overall HTTP deadline existed. | `deliver()` now wraps the asynchronous request in `asyncio.wait_for(..., timeout=5)`. A real delayed-response test verifies timeout recording even with HTTPX phase timeouts disabled. |
 | 16 | Persistent retry scheduling | Inspection found no stored next-attempt time; recovery of scheduled retries was unavailable. | The schema and pending-event query had no retry schedule. | `db/003_retry_schedule.sql` adds `next_attempt_at` and a partial index. `worker/worker.py` atomically records the schedule with the attempt and selects only due events, allowing other pending events to proceed. |
+| 17 | Concurrent worker ownership | A two-worker test reproduced two webhook deliveries for one event; one worker then raised `UniqueViolation` on the attempt-history constraint. | Workers selected pending rows without holding an exclusive claim through delivery. | `fetch_pending()` and `process_pending()` in `worker/worker.py` now use `FOR UPDATE SKIP LOCKED` inside a transaction covering one event's delivery and recording. |
+| 18 | In-flight crash recovery | Inspection found no exclusive in-flight ownership; previous recovery tests covered only already-scheduled retries. | Selection and outcome recording were separate transactions, and the delivery crash window was untested. | `worker/worker.py` holds a transactional row lock until commit. A crash rolls back unfinished writes and releases ownership; `tests/test_worker_reliability.py` verifies SIGKILL recovery and allowed redelivery after remote success. |
+| 19 | Worker shutdown | Inspection found no graceful SIGTERM handling and shell-form Docker startup. | The polling loop had no stop signal; the shell command did not launch Python directly as the container process. | `run()` in `worker/worker.py` handles SIGTERM/SIGINT, finishes the current attempt, and stops claiming work. `worker/Dockerfile` uses exec-form CMD. Process and container tests verified clean exit. |
 
 ## 2. Networking Diagnosis
 
@@ -57,6 +60,12 @@
 - **Step 5 deadline:** `deliver()` uses an HTTPX asynchronous client and a five-second `asyncio.wait_for` deadline around the entire HTTP request, in addition to HTTPX phase timeouts. Timeout outcomes have a null HTTP status and a descriptive error. Events are still delivered sequentially by one worker; asynchronous HTTP is used for the deadline, not multiple-event concurrency.
 - **Step 5 persistence:** `record_attempt()` commits the history row, counter, status, and next due time together. Temporary failures below the limit remain `pending`; their due time is computed using PostgreSQL `clock_timestamp()` plus the delay after the response. Terminal outcomes clear the schedule. `fetch_pending()` selects only due pending events with fewer than three attempts, ordered by due time and ID. No per-event backoff sleep blocks other pending work.
 - **Step 5 restart scope:** A restarted worker reads the saved attempt count and due time instead of resetting them. Tests stop a worker only after its retry transaction commits, then start its replacement. Recovery of an in-flight HTTP delivery and multiple-worker coordination remain deferred to Step 6. Existing failed events are not automatically requeued by the migration.
+
+- **Step 6 ownership:** `FOR UPDATE SKIP LOCKED` combines exclusive row ownership with non-blocking queue selection. Each worker locks one due event, performs its HTTP attempt, and commits its history, counter, status, and retry schedule before taking another event. Other workers skip the locked row, preventing simultaneous normal processing while continuing with other work. Workers do not reserve an entire batch ahead of delivery.
+- **Step 6 recovery:** Ownership is the database lock, not a separately committed `processing` flag or expiring lease. On process/connection failure, PostgreSQL rolls back the transaction and releases the lock; a surviving worker can select the unfinished event using its previously committed counter and schedule. API readers see the previous committed state until the outcome commits. No schema migration was needed.
+- **Step 6 delivery guarantee:** PostgreSQL cannot atomically commit a transaction with an external HTTP receiver. If the receiver accepts a request and the worker crashes before committing, recovery sends it again. This preserves at-least-once recovery and permits duplicates in that failure window. The three-attempt limit applies to recorded attempts; an aborted transaction can leave an HTTP request without a committed history row. Exactly-once delivery is not claimed.
+- **Step 6 trade-off:** Holding a transaction open across HTTP occupies a database connection and row lock during the bounded five-second request plus database work. This costs database resources compared with short claim transactions, but gives automatic rollback-based recovery without lease expiry or stale ownership. Locks cover one event only, and competing workers skip them.
+- **Step 6 shutdown:** SIGTERM/SIGINT sets an asynchronous stop event without cancelling the active delivery. The worker records that attempt's success, failure, or timeout, then takes no further work and closes its connections. Idle polling waits on the stop event and wakes immediately. Exec-form Docker CMD lets Python receive the container signal directly.
 
 ## 4. Starting and Verifying the System
 
@@ -145,6 +154,43 @@ docker compose ps worker
 - **Live permanent failure:** The same probe configured one `400` response. The event became failed with one recorded attempt; receiver inspection after another polling interval showed no retry. Receiver control was reset afterward. `docker compose logs --tail 10 worker` confirmed these outcomes.
 - `git diff --check` passed. Only worker code, its two test modules, and the new retry migration changed during implementation. API application code, Mock Receiver, and `SOLUTION.md` were unchanged during Step 5 implementation; one worker replica was left running.
 
+**Step 6:** The targeted `tests/test_worker_reliability.py::test_two_workers_deliver_one_event_only_once` test first failed against the Step 5 worker: the receiver captured two deliveries and one worker exited with a duplicate attempt-history `UniqueViolation`. After the fix, the full regression command was:
+
+```powershell
+docker compose stop worker
+docker compose run --rm --no-deps -v "${PWD}:/workspace" -w /workspace -e PYTHONDONTWRITEBYTECODE=1 -e RELAYOPS_TEST_DATABASE_URL=postgresql://relayops:relayops@db:5432/relayops -e RELAYOPS_BASE_URL=http://gateway api sh -c 'pip install -q -r tests/requirements.txt && python -m pytest tests/test_models.py tests/test_api_unit.py tests/test_api_integration.py tests/test_api_http.py tests/test_worker_unit.py tests/test_worker_integration.py tests/test_worker_reliability.py -q -ra --tb=short -p no:cacheprovider'
+```
+
+- **Regression result:** 127 passed in 57.86 seconds, exit code 0, no failures or skips. Includes the previous 118 tests and nine reliability tests. One third-party Starlette/AnyIO deprecation warning was reported.
+- **Concurrency:** Two real worker processes delivered one event once and a queue of 20 events once each. An explicitly locked event did not block delivery of another event. A two-worker retry test preserved three recorded attempts (`503 → 503 → 200`) and the required one- and two-second delays.
+- **Crash recovery:** SIGKILL during an unfinished delivery left no committed attempt; a replacement worker delivered the event and recorded one outcome. A separate test paused history insertion after receiver success, killed the owner, and verified recovery by a surviving worker. The receiver captured two successful requests while PostgreSQL retained one committed attempt, demonstrating the allowed at-least-once duplicate.
+- **Graceful shutdown:** SIGTERM during delivery completed and recorded the current event, left the next event pending, released the lock, and exited with code 0. An idle worker with a 60-second poll interval exited within two seconds. A worker awaiting a delayed response recorded the bounded timeout and retry schedule, released ownership, and exited with code 0 within six seconds.
+
+Built the image and ran the existing smoke tests with two Compose replicas:
+
+```powershell
+docker compose build worker
+docker compose up -d --no-build --scale worker=2 worker
+docker compose ps worker
+docker compose run --rm --no-deps -v "${PWD}:/workspace" -w /workspace -e PYTHONDONTWRITEBYTECODE=1 -e RELAYOPS_BASE_URL=http://api:8000 -e RELAYOPS_RECEIVER_URL=http://receiver:9000 worker sh -c 'pip install -q -r tests/requirements.txt && python -m pytest tests/test_smoke.py -v -ra --tb=short -p no:cacheprovider'
+```
+
+- **Smoke result:** 2 passed in 0.63 seconds, exit code 0, no failures or skips. Compose showed two running workers using `python worker.py` directly. The pytest container did not run an additional delivery worker.
+
+Verified Docker SIGTERM handling and restored both replicas:
+
+```powershell
+docker compose stop -t 7 worker
+$workerContainers = @(docker compose ps -a -q worker)
+docker inspect --format '{{.Name}} exit={{.State.ExitCode}}' $workerContainers
+docker compose logs --tail 8 worker
+docker compose up -d --no-build --scale worker=2 worker
+docker compose ps worker
+```
+
+- Both containers reported `exit=0`; both logs included `shutdown requested; finishing current attempt` and `worker stopped`. Final Compose output showed two workers running.
+- `git diff --check` passed. Step 6 changed only `worker/worker.py`, `worker/Dockerfile`, and the new `tests/test_worker_reliability.py`; API, Mock Receiver, schema, and solution documentation were unchanged during implementation.
+
 ## 5. AI Tools Used
 
 - Used Codex to inspect configuration, reproduce networking failures, edit four configuration files, and run container DNS, HTTP, database, and restart checks. Verified changes against actual command output and reviewed the diff; `git diff --check` passed. No API or worker source functionality was changed.
@@ -155,5 +201,7 @@ docker compose ps worker
 - **Step 4 mistake:** Codex constructed the test receiver URL by concatenating a base URL and `webhook` without a separating slash. The first combined run produced 17 failures and 62 passes; HTTPX reported an invalid port such as `34221webhook`. Replaced concatenation with `base_url.join("/webhook")`. The corrected combined suite passed all 79 tests, followed by both smoke tests.
 - **Step 5:** Codex implemented error classification, exponential backoff, seconds-based `Retry-After`, the total HTTP deadline, and transactional retry scheduling. It added unit and real-PostgreSQL/HTTP integration tests, applied the additive migration, and verified existing data using counts and checksums. Verification finished with 118 passing regressions, two passing container smoke tests, and live retry/permanent-failure probes using one worker.
 - **Step 5 verification:** Codex identified that the prior HTTPX phase timeout did not enforce a total five-second deadline and added a delayed-response test with phase timeouts disabled. No new implementation or test mistake was identified during Step 5.
+- **Step 6:** Codex wrote a real-process concurrency test that reproduced duplicate delivery before implementation, then added transactional row ownership, rollback-based recovery, signal handling, and direct Docker startup. Verification used real PostgreSQL and HTTP, SIGKILL at controlled delivery/commit boundaries, SIGTERM during active and idle work, all 127 regressions, and two smoke tests with two Compose workers. Docker exit codes and logs independently confirmed clean shutdown.
+- **Step 6 mistakes:** No new AI implementation or test mistake was identified; the initial test failure intentionally reproduced the existing concurrency race.
 
 ## 6. Future Improvements
