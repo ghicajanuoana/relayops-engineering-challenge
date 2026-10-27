@@ -14,6 +14,9 @@
 | 8 | API transactions | The migration waited on a relation lock; `pg_stat_activity` showed the old API idle in a GET transaction. Inspection also found requests shared a global connection. | Connections and transactions were not scoped to requests. | `api/app/db.py` creates independent connections; handlers in `api/app/main.py` use context managers for commit, rollback, and close. Stopping the old API released the migration lock. |
 | 9 | Request validation | Inspection found non-finite numbers and Unicode nulls could pass model validation despite PostgreSQL JSONB/text restrictions. | Payload values were unrestricted and strings had no null-character check. | Added validation in `api/app/models.py` and JSON-safe `422` error responses in `api/app/main.py`. Unit tests verify invalid requests never open a database connection. |
 | 10 | Database integrity | Inspection found no uniqueness, status, attempt-range, field-length, or payload-shape guards beyond the original keys and nullability. | The initial schema did not enforce these invariants. | `db/002_api_constraints.sql` adds event constraints, unique attempt numbers per event, and attempt/HTTP-code checks; the existing foreign key remains. Invalid writes and transaction rollback were tested against PostgreSQL. |
+| 11 | Worker HMAC signature | Earlier networking tests observed receiver `401` responses with `signature_valid=false`. | `worker/worker.py` signed `json.dumps` output but let HTTPX serialize the transmitted body separately. | Step 4 serializes once to UTF-8 bytes, signs those bytes, and sends them unchanged. The unchanged receiver accepted signatures, including Unicode payloads. |
+| 12 | Worker delivery status | Inspection found any HTTP response, including `401` or `503`, was treated as successful delivery. | The worker returned success without checking the response status. | `worker/worker.py` now marks only `2xx` as delivered and disables redirects. Tests verify non-2xx responses and network errors are recorded as failed. |
+| 13 | Worker attempt history | Inspection found the worker never inserted delivery-attempt rows; only final event counters/state were updated. | Delivery outcome recording was missing. | `record_attempt()` in `worker/worker.py` inserts the attempt and updates the event in one transaction. Real PostgreSQL tests verify HTTP codes, network errors, API history, and rollback of both writes on an update failure. |
 
 ## 2. Networking Diagnosis
 
@@ -38,6 +41,13 @@
 - **Constraints and migration:** `db/002_api_constraints.sql` enforces event ID uniqueness, 1–200 character identifiers/types, object payloads, valid statuses, 0–3 event attempts, unique `(event_pk, attempt)`, attempt numbers 1–3, and nullable HTTP codes restricted to 100–599. Fresh database initialization applies both schema files; existing volumes require the new migration once. Run it transactionally with the old API and workers stopped. Invalid legacy data aborts migration rather than being deleted.
 - **Validation:** Required fields and their types/lengths are validated before database access. PostgreSQL-incompatible null characters and non-finite numbers are rejected with `422`. Validation responses retain error location, type, and message while omitting values that cannot safely be serialized as JSON.
 - **Test isolation:** PostgreSQL integration tests create a uniquely named temporary database, apply both SQL files, and drop it afterward. Live HTTP tests use unique event IDs and remove only their own rows. Workers are stopped during API verification; webhook delivery, retries, and worker concurrency remain outside this step.
+
+- **Step 4 delivery:** `fetch_pending()` reads pending events in ID order with a batch limit. `process_pending()` sends each event once and records its outcome. `main()` polls using a shared HTTPX client configured with a five-second timeout. No work claiming or multiple-worker coordination was added.
+- **Step 4 signing:** `serialize_event()` includes only `event_id`, `type`, and `payload` in compact UTF-8 JSON. `sign()` calculates HMAC-SHA256 using `WEBHOOK_SECRET`; `deliver()` sends the identical bytes with `Content-Type: application/json` and `X-RelayOps-Signature: sha256=<hex>`. Receiver implementation and API contract remain unchanged.
+- **Step 4 outcomes:** `DeliveryResult` distinguishes HTTP responses from network errors. Only codes 200–299 are successful. Every other HTTP response is recorded with its status code and a null error; network failures have a null status code and an error containing the exception type and description.
+- **Step 4 persistence:** `record_attempt()` increments the stored attempt count, inserts its history row, and updates event status and `updated_at` in one transaction. A database failure rolls both writes back; the HTTP request itself cannot be rolled back. Crash recovery and worker concurrency remain deferred.
+- **Step 4 failure policy:** All unsuccessful attempts, including `429`, `5xx`, and network errors, currently end in `failed` after one attempt. Later polls select only pending events, so failures are not retried automatically. The old immediate retry loop was removed; retry scheduling, backoff, and `Retry-After` handling are deferred to Step 5.
+- **Step 4 test isolation:** API and worker integration tests share the temporary-database fixture in `tests/conftest.py`. Worker integration tests start the existing receiver over real HTTP and run delivery workers sequentially, including one-process tests. `tests/requirements.txt` now includes Uvicorn for the receiver. Container smoke tests explicitly use one worker replica.
 
 ## 4. Starting and Verifying the System
 
@@ -68,11 +78,37 @@ docker compose run --rm --no-deps -v "${PWD}:/workspace" -w /workspace -e PYTHON
 - **Migration diagnosis:** A `pg_stat_activity` query selecting PID, state, wait events, and query text showed the migration waiting on a relation lock and the old API idle in a GET transaction. `docker compose stop api` released the lock and allowed migration to finish.
 - Delivery smoke tests were not run in this step because delivery logic remains unchanged. Workers were left stopped after API verification.
 
+**Step 4:** Ran the API regressions and new worker tests with Compose workers stopped:
+
+```powershell
+docker compose stop worker
+docker compose run --rm --no-deps -v "${PWD}:/workspace" -w /workspace -e PYTHONDONTWRITEBYTECODE=1 -e RELAYOPS_TEST_DATABASE_URL=postgresql://relayops:relayops@db:5432/relayops -e RELAYOPS_BASE_URL=http://gateway api sh -c 'pip install -q -r tests/requirements.txt && python -m pytest tests/test_models.py tests/test_api_unit.py tests/test_api_integration.py tests/test_api_http.py tests/test_worker_unit.py tests/test_worker_integration.py -q -ra --tb=short -p no:cacheprovider'
+```
+
+- **Result:** 79 passed in 9.59 seconds, exit code 0, no failures or skips. This includes all 49 Step 3 API tests and 30 worker tests (11 unit and 19 integration tests). One third-party Starlette/AnyIO deprecation warning was reported.
+- Worker tests verify a known HMAC-SHA256 vector, exact payload fields, Unicode delivery, successful and unsuccessful HTTP statuses, invalid signatures, connection refusal, timeout recording, ordered/bounded pending selection, atomic database rollback, and no automatic second attempt. Receiver `/received` confirms real HTTP arrivals and signature validity. Separate process tests run one worker at a time for `200` and `503` outcomes.
+
+Built and started exactly one Compose worker, then ran the existing smoke tests:
+
+```powershell
+docker compose up --build -d --scale worker=1 worker
+docker compose ps worker
+docker compose run --rm --no-deps -v "${PWD}:/workspace" -w /workspace -e PYTHONDONTWRITEBYTECODE=1 -e RELAYOPS_BASE_URL=http://api:8000 -e RELAYOPS_RECEIVER_URL=http://receiver:9000 worker sh -c 'pip install -q -r tests/requirements.txt && python -m pytest tests/test_smoke.py -v -ra --tb=short -p no:cacheprovider'
+docker compose ps worker
+docker compose logs --tail 8 worker
+```
+
+- **Smoke result:** 2 passed in 1.73 seconds, exit code 0, no failures or skips. These tests use the API and receiver service addresses directly. `docker compose ps worker` showed one running worker; its logs showed attempt 1, HTTP `200`, and status `delivered` for smoke-test events.
+- The container running pytest overrides the worker command and does not run another delivery worker. One Compose delivery worker was left running. Continue using `--scale worker=1` until multiple-worker coordination is implemented; the default replica configuration was not changed.
+- `git diff --check` passed. API application code, schema, and Mock Receiver were unchanged in Step 4.
+
 ## 5. AI Tools Used
 
 - Used Codex to inspect configuration, reproduce networking failures, edit four configuration files, and run container DNS, HTTP, database, and restart checks. Verified changes against actual command output and reviewed the diff; `git diff --check` passed. No API or worker source functionality was changed.
 - Codex initially embedded a Python HTTP probe in a PowerShell command using quoting that did not survive native argument passing. Python received an unquoted URL and raised `SyntaxError`, so that probe provided no connectivity evidence. Codex corrected it by sending the script through a PowerShell literal here-string to `docker compose exec -T api python -`; the corrected probe returned the API health response.
 - **Step 3:** Codex implemented the API handlers, request-scoped transactions, validation, SQL migration, and unit/integration/live HTTP tests. Verification used real PostgreSQL, live requests through Nginx, direct database assertions, and concurrent request tests. The live tests first reproduced the original idempotency failures; the final scoped suite passed all 49 tests. Documentation was updated only after implementation and testing.
 - **Step 3 mistake:** Codex attempted the migration before stopping the old API. The migration blocked because that API held an idle GET transaction. `pg_stat_activity` identified the lock holder; stopping the API released it, and migration completed. The documented migration procedure now stops the API first.
+- **Step 4:** Codex implemented single-attempt worker delivery, exact-byte HMAC signing, response classification, transactional attempt recording, and worker tests. Verification combined all 49 API regressions with 30 worker tests against real PostgreSQL and the unchanged receiver over HTTP, followed by two container smoke tests with one worker replica.
+- **Step 4 mistake:** Codex constructed the test receiver URL by concatenating a base URL and `webhook` without a separating slash. The first combined run produced 17 failures and 62 passes; HTTPX reported an invalid port such as `34221webhook`. Replaced concatenation with `base_url.join("/webhook")`. The corrected combined suite passed all 79 tests, followed by both smoke tests.
 
 ## 6. Future Improvements

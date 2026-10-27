@@ -5,9 +5,7 @@ Each run creates and drops its own database. The application database is untouch
 import os
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
-from pathlib import Path
 from threading import Barrier
-from uuid import uuid4
 
 import psycopg
 from psycopg import sql
@@ -23,23 +21,6 @@ pytestmark = pytest.mark.skipif(
     not os.environ.get("RELAYOPS_TEST_DATABASE_URL"),
     reason="set RELAYOPS_TEST_DATABASE_URL to run real PostgreSQL tests",
 )
-
-
-@pytest.fixture(scope="module")
-def database_url():
-    admin_url = os.environ["RELAYOPS_TEST_DATABASE_URL"]
-    name = "relayops_test_" + uuid4().hex
-    with psycopg.connect(admin_url, autocommit=True) as admin:
-        admin.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(name)))
-    url = psycopg.conninfo.make_conninfo(admin_url, dbname=name)
-    try:
-        with psycopg.connect(url) as conn:
-            for path in sorted((Path(__file__).resolve().parents[1] / "db").glob("*.sql")):
-                conn.execute(path.read_text(encoding="utf-8"))
-        yield url
-    finally:
-        with psycopg.connect(admin_url, autocommit=True) as admin:
-            admin.execute(sql.SQL("DROP DATABASE {} WITH (FORCE)").format(sql.Identifier(name)))
 
 
 @pytest.fixture
