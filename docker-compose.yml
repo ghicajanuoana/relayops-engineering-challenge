@@ -1,19 +1,49 @@
+x-database-environment: &database-environment
+  PGHOST: db
+  PGPORT: "5432"
+  PGUSER: ${POSTGRES_USER:-relayops}
+  PGPASSWORD: ${POSTGRES_PASSWORD:?Run python scripts/configure.py first}
+  PGDATABASE: ${POSTGRES_DB:-relayops}
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 services:
   gateway:
-    image: nginx:1.27-alpine
+    image: nginx:1.27-alpine@sha256:65645c7bb6a0661892a8b03b89d0743208a18dd2f3f17a54ef4b76fb8e2f2a10
+    restart: unless-stopped
+    logging: *logging
     ports:
-      - "8080:80"
+      - "${GATEWAY_PORT:-8080}:80"
     volumes:
       - ./infrastructure/nginx.conf:/etc/nginx/conf.d/default.conf:ro
     depends_on:
-      - api
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
     networks:
       - frontend
 
   api:
     build: ./api
+    restart: unless-stopped
+    logging: *logging
     environment:
-      DATABASE_URL: postgresql://relayops:relayops@db:5432/relayops
+      <<: *database-environment
+    healthcheck:
+      test: ["CMD", "python", "-m", "app.healthcheck"]
+      interval: 5s
+      timeout: 8s
+      retries: 5
+      start_period: 10s
     depends_on:
       db:
         condition: service_healthy
@@ -23,15 +53,26 @@ services:
 
   worker:
     build: ./worker
+    restart: unless-stopped
+    stop_grace_period: 10s
+    logging: *logging
     environment:
-      DATABASE_URL: postgresql://relayops:relayops@db:5432/relayops
-      RECEIVER_URL: http://receiver:9000/webhook
-      WEBHOOK_SECRET: relayops-dev-secret
+      <<: *database-environment
+      RECEIVER_URL: ${RECEIVER_URL:-http://receiver:9000/webhook}
+      WEBHOOK_SECRET: ${WEBHOOK_SECRET:?Run python scripts/configure.py first}
+      POLL_INTERVAL: ${POLL_INTERVAL:-1}
+      BATCH_SIZE: ${BATCH_SIZE:-10}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import worker; worker.check_health()"]
+      interval: 5s
+      timeout: 6s
+      retries: 3
+      start_period: 10s
     depends_on:
       db:
         condition: service_healthy
       receiver:
-        condition: service_started
+        condition: service_healthy
     deploy:
       replicas: 2
     networks:
@@ -40,20 +81,31 @@ services:
 
   receiver:
     build: ./receiver
+    restart: unless-stopped
+    logging: *logging
     environment:
-      WEBHOOK_SECRET: relayops-dev-secret
+      WEBHOOK_SECRET: ${WEBHOOK_SECRET:?Run python scripts/configure.py first}
     ports:
-      - "9000:9000"
+      - "${RECEIVER_PORT:-9000}:9000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9000/health', timeout=2).close()"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
     networks:
       - webhooks
 
   db:
-    image: postgres:16-alpine
+    image: postgres:16-alpine@sha256:0cefaabd882e42bcb2a2f3dc56d3ce4770560ba62fd7f197f1a2e008fd5731ab
+    restart: unless-stopped
+    logging: *logging
+    command: ["postgres", "-c", "hba_file=/etc/postgresql/pg_hba.conf"]
     environment:
-      POSTGRES_USER: relayops
-      POSTGRES_PASSWORD: relayops
-      POSTGRES_DB: relayops
-      POSTGRES_HOST_AUTH_METHOD: trust
+      POSTGRES_USER: ${POSTGRES_USER:-relayops}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Run python scripts/configure.py first}
+      POSTGRES_DB: ${POSTGRES_DB:-relayops}
+      POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
       interval: 2s
@@ -62,8 +114,35 @@ services:
     volumes:
       - pgdata:/var/lib/postgresql/data
       - ./db:/docker-entrypoint-initdb.d:ro
+      - ./infrastructure/pg_hba.conf:/etc/postgresql/pg_hba.conf:ro
     networks:
       - backend
+
+  tests:
+    profiles: [test]
+    build:
+      context: .
+      dockerfile: tests/Dockerfile
+    environment:
+      <<: *database-environment
+      WEBHOOK_SECRET: ${WEBHOOK_SECRET:?Run python scripts/configure.py first}
+      RELAYOPS_BASE_URL: http://gateway
+      RELAYOPS_RECEIVER_URL: http://receiver:9000
+    volumes:
+      - ./test-results:/test-results
+    depends_on:
+      db:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+      gateway:
+        condition: service_healthy
+      receiver:
+        condition: service_healthy
+    networks:
+      - frontend
+      - backend
+      - webhooks
 
 networks:
   frontend:

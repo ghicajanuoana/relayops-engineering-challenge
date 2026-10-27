@@ -5,21 +5,53 @@ import hashlib
 import hmac
 import json
 import os
+from pathlib import Path
 import signal
+import time
 
 import httpx
 import psycopg
 from psycopg.rows import dict_row
 
-DATABASE_URL = os.environ.get(
-    "DATABASE_URL", "postgresql://relayops:relayops@db:5432/relayops"
-)
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
 RECEIVER_URL = os.environ.get("RECEIVER_URL", "http://receiver:9000/webhook")
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
 POLL_INTERVAL = float(os.environ.get("POLL_INTERVAL", "1"))
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "10"))
 MAX_ATTEMPTS = 3
 ATTEMPT_TIMEOUT = 5
+
+
+def log_event(event: str, **fields):
+    message = json.dumps({"event": event, "pid": os.getpid(), **fields})
+    for name in ("PGPASSWORD", "POSTGRES_PASSWORD", "WEBHOOK_SECRET"):
+        secret = os.environ.get(name)
+        if secret:
+            for variant in (secret, json.dumps(secret)[1:-1]):
+                message = message.replace(variant, "[REDACTED]")
+    print(message, flush=True)
+
+
+def heartbeat_path(pid: int) -> Path:
+    return Path(f"/tmp/relayops-worker-{pid}.heartbeat")
+
+
+def heartbeat():
+    path = heartbeat_path(os.getpid())
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(str(time.monotonic()), encoding="utf-8")
+    temporary.replace(path)
+
+
+def check_health():
+    try:
+        age = time.monotonic() - float(heartbeat_path(1).read_text(encoding="utf-8"))
+        if not 0 <= age <= max(15, POLL_INTERVAL + ATTEMPT_TIMEOUT + 5):
+            raise ValueError("stale heartbeat")
+        with psycopg.connect(DATABASE_URL, connect_timeout=3, options="-c statement_timeout=2000") as conn:
+            conn.execute("SELECT next_attempt_at FROM events LIMIT 0")
+    except Exception:
+        raise SystemExit("worker readiness check failed") from None
 
 
 def sign(raw: bytes) -> str:
@@ -95,7 +127,8 @@ async def deliver(client: httpx.AsyncClient, event: dict) -> DeliveryResult:
     except TimeoutError:
         return DeliveryResult(status_code=None, error=f"TimeoutError: HTTP attempt exceeded {ATTEMPT_TIMEOUT} seconds")
     except httpx.RequestError as exc:
-        return DeliveryResult(status_code=None, error=f"{type(exc).__name__}: {exc}")
+        # Exception text can contain URL credentials or tokens; keep only type.
+        return DeliveryResult(status_code=None, error=f"{type(exc).__name__}: webhook request failed")
 
 
 def record_attempt(conn, event: dict, result: DeliveryResult) -> str:
@@ -144,11 +177,10 @@ async def process_pending(conn, client: httpx.AsyncClient, stop_event: asyncio.E
             result = await deliver(client, event)
             status = record_attempt(conn, event, result)
         processed += 1
-        print(
-            f"event_id={event['event_id']} attempt={event['attempts'] + 1} "
-            f"status={status} "
-            f"status_code={result.status_code} error={result.error}",
-            flush=True,
+        heartbeat()
+        log_event(
+            "delivery_attempt", event_id=event["event_id"], attempt=event["attempts"] + 1,
+            status=status, status_code=result.status_code, error=result.error,
         )
     return processed
 
@@ -159,16 +191,20 @@ async def run():
 
     def request_stop():
         if not stop_event.is_set():
-            print("shutdown requested; finishing current attempt", flush=True)
+            log_event("shutdown_requested", message="finishing current attempt")
             stop_event.set()
 
     for signum in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(signum, request_stop)
-    print(f"worker started, receiver={RECEIVER_URL}", flush=True)
+    if not WEBHOOK_SECRET:
+        raise ValueError("WEBHOOK_SECRET must be configured")
+    log_event("worker_started")
     try:
-        with psycopg.connect(DATABASE_URL, row_factory=dict_row, autocommit=True) as conn:
+        with psycopg.connect(DATABASE_URL, row_factory=dict_row, autocommit=True, connect_timeout=5) as conn:
+            heartbeat()
             async with httpx.AsyncClient(timeout=ATTEMPT_TIMEOUT) as client:
                 while not stop_event.is_set():
+                    heartbeat()
                     if not await process_pending(conn, client, stop_event):
                         try:
                             await asyncio.wait_for(stop_event.wait(), timeout=POLL_INTERVAL)
@@ -177,11 +213,16 @@ async def run():
     finally:
         for signum in (signal.SIGTERM, signal.SIGINT):
             loop.remove_signal_handler(signum)
-    print("worker stopped", flush=True)
+        heartbeat_path(os.getpid()).unlink(missing_ok=True)
+    log_event("worker_stopped")
 
 
 def main():
-    asyncio.run(run())
+    try:
+        asyncio.run(run())
+    except Exception as exc:
+        log_event("worker_failed", error_type=type(exc).__name__)
+        raise SystemExit(1) from None
 
 
 if __name__ == "__main__":

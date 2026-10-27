@@ -26,6 +26,12 @@
 | 20 | Request tracing | The baseline gateway health response had no `X-Request-ID`; inspection found no request-ID logging or propagation. | Nginx and FastAPI had no shared request-ID handling. | `infrastructure/nginx.conf` generates or preserves IDs, forwards them, and adds them to every response. New `api/app/observability.py` and changes in `api/app/main.py` return and log IDs, including application failures. |
 | 21 | Prometheus metrics | Baseline `GET /metrics` returned `404`. | The endpoint was missing. | `api/app/main.py` now returns all four event-status gauges and the recorded delivery-attempt counter in Prometheus text format. Tests cover empty and populated databases. |
 | 22 | PostgreSQL host exposure | `docker compose port db 5432` returned `127.0.0.1:64438`. | The automatically loaded override published PostgreSQL outside its container network to the host. | Removed port publishing from `docker-compose.override.yml`. Runtime inspection confirmed no host binding; API and worker database connections still succeeded. |
+| 23 | Hardcoded credentials | Inspection found embedded database credentials, a fixed webhook secret, and an unused example environment configuration. | Compose and application defaults supplied credentials directly. | `scripts/configure.py` generates ignored local secrets; `.env.example` documents settings; `docker-compose.yml`, `api/app/db.py`, and `worker/worker.py` use environment configuration without credential defaults. |
+| 24 | PostgreSQL authentication | Inspection found TCP `trust` authentication; changing container environment alone would not update an existing database role password. | Authentication rules and role credentials persist beyond container recreation. | `scripts/configure.py` synchronizes the existing role through its local maintenance socket. `infrastructure/pg_hba.conf` requires SCRAM-SHA-256 for TCP; the database volume and existing user/database names are retained. |
+| 25 | Container readiness | Only PostgreSQL had a container health check; other service readiness and worker progress were not checked. | Docker configuration lacked health probes and sufficient health-gated dependencies. | `docker-compose.yml` adds checks for all services. `api/app/healthcheck.py` verifies HTTP and schema access; `worker/worker.py` maintains an atomic heartbeat and checks database access. |
+| 26 | Sensitive logging | Inspection found worker startup logged the receiver URL and stored raw network exception text, which could contain credentials. | Logging did not separate safe diagnostic metadata from sensitive configuration. | Worker JSON logs omit URLs and raw exceptions; `api/app/observability.py` and `api/logging.json` redact configured credentials, including tracebacks. Dockerfiles disable redundant API/receiver access logging; runtime logs are rotated. |
+| 27 | Reproducibility | Inspection found floating image tags and unpinned transitive Python dependencies. | Top-level requirement pins did not fix the complete runtime environment. | Dockerfiles and Compose pin image digests; service/test `requirements.lock` files pin installed versions. `tests/Dockerfile` provides a consistent test environment, and `.dockerignore` excludes private configuration. |
+| 28 | CI automation | `.github/workflows/ci.yml` only printed a TODO. | No automated startup, test gates, reports, or cleanup existed. | The workflow now runs health-gated dependency startup, regressions, two-worker smoke tests, failure diagnostics, JUnit upload, and volume-preserving cleanup using `tests/run_tests.py`. |
 
 ## 2. Networking Diagnosis
 
@@ -93,6 +99,13 @@ docker compose logs --since 3m api gateway | Select-String -Pattern 'step7-provi
 - **Step 7 logs:** Nginx access logs and API request logs use JSON with request ID, method, path, and status; Nginx also includes upstream status. API logs use the existing Uvicorn logger and record server failures at error level. Worker logging and delivery behavior were unchanged.
 - **Step 7 metrics:** `/metrics` uses one PostgreSQL statement for a consistent snapshot, counts stored events by status, and counts delivery-history rows. It emits all four status samples, including zeros, with Prometheus HELP/TYPE lines and `text/plain; version=0.0.4; charset=utf-8`. These reflect committed database states; Step 6's in-flight locks do not introduce a committed `processing` state. `/health` remains the existing database-independent liveness endpoint.
 - **Step 7 isolation:** Removed only the override's PostgreSQL port publication. API and workers continue using `db:5432` on the existing backend network; gateway and receiver remain on separate networks without database DNS access. The database volume and schema were retained. The existing 2 MiB Nginx body limit already accommodates a 1 MiB payload plus its JSON envelope and was not changed.
+
+- **Step 8 configuration:** `python scripts/configure.py` generates random database/HMAC secrets in a Git-ignored `.env` and preserves an existing file. Compose requires non-empty secrets rather than supplying insecure defaults. API/worker database connections use standard libpq `PG*` environment variables, avoiding password URL-escaping problems; explicit `DATABASE_URL` remains supported without an embedded fallback. Worker and receiver receive the same configured HMAC key. Private environment files are excluded from the root Docker build context.
+- **Step 8 authentication:** Existing installations synchronize the configured password with the existing PostgreSQL role over the container-local maintenance socket before using the updated environment. Mounted authentication rules require SCRAM-SHA-256 for IPv4/IPv6 TCP; trusted Unix-socket maintenance remains confined to the database container. Password changes do not reinitialize data or change database/user names. PostgreSQL remains unpublished on the host.
+- **Step 8 health and restart:** PostgreSQL checks TCP readiness; API checks HTTP liveness plus schema access; gateway and receiver check HTTP. Workers check a recent, atomically replaced heartbeat plus schema access. Health-gated dependencies prevent premature startup. Runtime services use `unless-stopped`, with a ten-second worker shutdown grace period. Restart policies handle process exits; an unhealthy status alone does not automatically restart Docker containers. `/health` retains its previous liveness contract.
+- **Step 8 logging:** API formatting retains request IDs and redacts known credentials in messages and tracebacks. Workers log event IDs, PID, attempt, status, and exception type without receiver URLs or raw network exception text. Receiver access logging is disabled to avoid query-string logging. Runtime Docker logs rotate at 10 MB with three files per container; output is unbuffered.
+- **Step 8 reproducibility:** Python, PostgreSQL, and Nginx base images are pinned by digest. API, worker, receiver, and test dependency locks capture exact installed package versions while retaining source requirements. The test-profile image includes application/schema/test sources and the locked test environment, avoiding ad hoc package installation during CI test execution. Startup, upgrades, and verification are documented in `docs/OPERATIONS.md` and linked from README.
+- **Step 8 CI:** Pushes and pull requests run on an Ubuntu runner with read-only repository permissions and pinned checkout/artifact actions. CI generates isolated credentials, starts healthy database/API/gateway/receiver services, and runs regressions with Compose workers absent. It then starts two workers and runs smoke tests. `tests/run_tests.py` constructs connection settings in the process environment, returns pytest's exit code, and writes JUnit XML. Failures collect diagnostics; report upload and `docker compose down` run unconditionally without deleting volumes. No repository secrets or cloud deployment are required.
 
 ## 4. Starting and Verifying the System
 
@@ -245,6 +258,51 @@ docker compose ps
 - **Smoke result:** 2 passed in 0.64 seconds, exit code 0, no failures or skips. Final Compose output showed all services running, PostgreSQL healthy with only internal `5432/tcp`, and two worker replicas.
 - `git diff --check` passed. Step 7 changed Nginx configuration, the Compose override, API tracing/metrics, and three new test files. Worker code, Mock Receiver, schema, and solution documentation were unchanged during implementation.
 
+**Step 8:** Configuration is now required before the first startup. The verified automated startup command was:
+
+```powershell
+python scripts/configure.py
+docker compose config --quiet
+docker compose up --build -d --wait --wait-timeout 120
+docker compose ps
+```
+
+- All six runtime containers became healthy, including two workers. After configuration, the normal foreground startup remains `docker compose up --build`. Re-running configuration preserved the existing `.env` content and synchronized the same database password without deleting data.
+- **Upgrade preservation:** Before/after checksum queries through `docker compose exec -T db psql -U relayops -d relayops -At` confirmed all 20 existing event rows and 21 history rows were unchanged. Authentication-rule inspection returned local `trust` and TCP `scram-sha-256`. Integration tests confirmed an incorrect TCP password was rejected and the configured credentials could execute `SELECT 1`.
+
+Ran the same regression and smoke commands used by CI:
+
+```powershell
+docker compose stop worker
+docker compose --profile test run --build --rm tests regression
+docker compose up --build -d --wait --wait-timeout 120
+docker compose --profile test run --rm tests smoke
+```
+
+- **Regression result:** 166 passed in the final run (59.88 seconds), exit code 0, no failures or skips. Includes all 155 previous regressions and 11 DevOps tests in `tests/test_devops_unit.py` and `tests/test_devops_integration.py`. Tests cover secret redaction, safe network errors, heartbeat validation, and password authentication. One third-party Starlette/AnyIO deprecation warning remained.
+- **Main-installation smoke result:** 2 passed in 1.08 seconds, exit code 0, no failures or skips, with two healthy workers and the new credentials/HMAC configuration. JUnit reports were generated under `test-results/`.
+
+Fresh installation was verified in a separate PowerShell session and Compose project with independent secrets, a new volume, and randomly assigned host ports:
+
+```powershell
+$env:COMPOSE_PROJECT_NAME='relayops-step8-fresh'
+$env:GATEWAY_PORT='0'
+$env:RECEIVER_PORT='0'
+python scripts/configure.py --env-file .env.step8-fresh
+docker compose --env-file .env.step8-fresh -p relayops-step8-fresh config --quiet
+docker compose --env-file .env.step8-fresh -p relayops-step8-fresh up --build --wait --wait-timeout 120
+docker compose --env-file .env.step8-fresh -p relayops-step8-fresh --profile test run --build --rm tests smoke
+docker compose --env-file .env.step8-fresh -p relayops-step8-fresh down
+docker compose --env-file .env.step8-fresh -p relayops-step8-fresh up --build --wait --wait-timeout 120
+```
+
+- **Fresh-installation smoke result:** 2 passed in 0.59 seconds, exit code 0, no failures or skips. Together with the main installation, four smoke-test executions passed across the two deployments.
+- **Restart preservation:** The isolated installation became healthy again with two workers after `down`/`up`. Checksums for its two event rows and two history rows matched before and after restart. Its containers were subsequently stopped with the same project-specific `down` command; its volume was retained. No existing volume was deleted or reinitialized.
+- **CI failure gate:** A disposable container ran an intentionally failing temporary test through `tests/run_tests.py`, selecting only that case. It reported one expected failure and propagated exit code 1 through pytest, the launcher, and Compose. This was a deliberate gate check, separate from the passing regression suite; its JUnit report used a separate filename.
+- **Additional checks:** Workflow YAML was parsed locally and checked for push/PR triggers, regression/smoke gates, unconditional reports/cleanup, and no error suppression. `python -m pip check` passed in all four runtime/test images. Internal log scans found neither configured password nor HMAC secret; no secret values were printed. `git check-ignore` confirmed private environment files and reports were ignored. Compose validation and `git diff --check` passed.
+- **GitHub limitation:** GitHub Actions has not been executed on GitHub. Hosted runner behavior, checkout, secret masking, artifact upload, and displayed job status still require a real push/PR workflow run. Local checks do not establish hosted CI success.
+- Final state: the main installation has six healthy runtime containers, including exactly two workers; validation-project data remains in its retained volume. API/worker functional contracts, receiver API, and existing application data were preserved. `SOLUTION.md` was not changed during implementation.
+
 ## 5. AI Tools Used
 
 - Used Codex to inspect configuration, reproduce networking failures, edit four configuration files, and run container DNS, HTTP, database, and restart checks. Verified changes against actual command output and reviewed the diff; `git diff --check` passed. No API or worker source functionality was changed.
@@ -260,5 +318,8 @@ docker compose ps
 - **Step 7:** Codex first verified the existing proxy, 1 MiB payload round trip, and health endpoint, then added tracing, metrics, database isolation, and 28 tests. Verification used 155 passing regressions, two passing smoke tests, actual service logs, live gateway failures, runtime port inspection, and Docker DNS/TCP/database probes. Existing worker and receiver behavior was preserved.
 - **Step 7 timeout mistake:** The initial upstream-failure probe used a five-second client timeout, matching Nginx's connection timeout, and expected `502`. It timed out before reading a gateway response. Codex restored the API, reran with a 15-second client timeout and accepted upstream-error codes `502`/`504`, then verified the actual `504` responses and their IDs. No application or Nginx timeout change was needed.
 - **Step 7 log-check correction:** A diagnostic matcher initially missed gateway IDs because PowerShell formatted matching lines across multiple display lines. Reading each match's raw `Line` property confirmed both provided and generated IDs in the gateway and API logs.
+- **Step 8:** Codex inspected Docker/environment/logging configuration, implemented secret bootstrap and non-destructive authentication updates, health checks, safe logs, dependency locks, a shared test image/runner, CI, and operating instructions. Verification used all 166 regressions, four smoke-test executions across existing/fresh installations, preserved-data checksums, password rejection, health inspection, dependency checks, and secret-free log scans. It also deliberately tested nonzero failure propagation; GitHub-hosted execution remains unverified.
+- **Step 8 configuration-order mistake:** Codex initially issued a Compose stop command before creating `.env`. Required-variable validation rejected the command. It generated configuration, synchronized the role password, and reran the stop/start sequence successfully; checksum checks confirmed data preservation.
+- **Step 8 diagnostic correction:** The first image-digest command used a quoted Go-template separator that PowerShell did not pass correctly; Docker reported a template parsing error. Replaced it with `{{json .RepoDigests}}` and used the returned digests. Code inspection also prompted atomic heartbeat writes, followed by the final full regression rerun.
 
 ## 6. Future Improvements

@@ -1,5 +1,9 @@
 # RelayOps — Engineering Challenge
 
+> Implemented startup, upgrade, secrets, health checks, and CI/test procedures:
+> [Operations guide](docs/OPERATIONS.md). Run `python scripts/configure.py` before
+> the first `docker compose up --build` to create private local configuration.
+
 **Senior · Software Engineering · Networking · DevOps · AI**
 
 | Software | Networking | DevOps | Timp recomandat | Livrare |

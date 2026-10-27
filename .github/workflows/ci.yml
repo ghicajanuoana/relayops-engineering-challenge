@@ -4,9 +4,43 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
-  placeholder:
+  tests:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      COMPOSE_PROJECT_NAME: relayops-ci-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
-      - uses: actions/checkout@v4
-      - run: echo "TODO - add a real pipeline (tests, build, smoke test)"
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - name: Generate isolated local credentials
+        run: python3 scripts/configure.py
+      - name: Validate Compose
+        run: docker compose config --quiet
+      - name: Start API dependencies
+        run: docker compose up --build --wait --wait-timeout 120 db receiver api gateway
+      - name: Unit and integration tests
+        run: docker compose --profile test run --build --rm tests regression
+      - name: Start two workers
+        run: docker compose up --build --wait --wait-timeout 120 worker
+      - name: Delivery smoke tests
+        run: docker compose --profile test run --rm tests smoke
+      - name: Diagnostics on failure
+        if: failure()
+        run: |
+          docker compose ps -a
+          docker compose logs --no-color --tail 200
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: test-results
+          path: test-results/*.xml
+          if-no-files-found: warn
+      - name: Stop containers without deleting volumes
+        if: always()
+        run: docker compose down
