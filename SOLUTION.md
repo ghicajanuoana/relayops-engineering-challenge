@@ -17,6 +17,9 @@
 | 11 | Worker HMAC signature | Earlier networking tests observed receiver `401` responses with `signature_valid=false`. | `worker/worker.py` signed `json.dumps` output but let HTTPX serialize the transmitted body separately. | Step 4 serializes once to UTF-8 bytes, signs those bytes, and sends them unchanged. The unchanged receiver accepted signatures, including Unicode payloads. |
 | 12 | Worker delivery status | Inspection found any HTTP response, including `401` or `503`, was treated as successful delivery. | The worker returned success without checking the response status. | `worker/worker.py` now marks only `2xx` as delivered and disables redirects. Tests verify non-2xx responses and network errors are recorded as failed. |
 | 13 | Worker attempt history | Inspection found the worker never inserted delivery-attempt rows; only final event counters/state were updated. | Delivery outcome recording was missing. | `record_attempt()` in `worker/worker.py` inserts the attempt and updates the event in one transaction. Real PostgreSQL tests verify HTTP codes, network errors, API history, and rollback of both writes on an update failure. |
+| 14 | Temporary delivery failures | Step 4 intentionally marked temporary failures failed after one attempt. | Retry classification, backoff, and `Retry-After` handling were deferred. | Step 5 adds these in `worker/worker.py`: retry network errors, timeouts, `429`, and `5xx`; fail permanent errors immediately; stop after three recorded attempts. |
+| 15 | HTTP attempt deadline | Inspection found the five-second HTTPX timeout limited individual network phases, not total request duration. | No overall HTTP deadline existed. | `deliver()` now wraps the asynchronous request in `asyncio.wait_for(..., timeout=5)`. A real delayed-response test verifies timeout recording even with HTTPX phase timeouts disabled. |
+| 16 | Persistent retry scheduling | Inspection found no stored next-attempt time; recovery of scheduled retries was unavailable. | The schema and pending-event query had no retry schedule. | `db/003_retry_schedule.sql` adds `next_attempt_at` and a partial index. `worker/worker.py` atomically records the schedule with the attempt and selects only due events, allowing other pending events to proceed. |
 
 ## 2. Networking Diagnosis
 
@@ -48,6 +51,12 @@
 - **Step 4 persistence:** `record_attempt()` increments the stored attempt count, inserts its history row, and updates event status and `updated_at` in one transaction. A database failure rolls both writes back; the HTTP request itself cannot be rolled back. Crash recovery and worker concurrency remain deferred.
 - **Step 4 failure policy:** All unsuccessful attempts, including `429`, `5xx`, and network errors, currently end in `failed` after one attempt. Later polls select only pending events, so failures are not retried automatically. The old immediate retry loop was removed; retry scheduling, backoff, and `Retry-After` handling are deferred to Step 5.
 - **Step 4 test isolation:** API and worker integration tests share the temporary-database fixture in `tests/conftest.py`. Worker integration tests start the existing receiver over real HTTP and run delivery workers sequentially, including one-process tests. `tests/requirements.txt` now includes Uvicorn for the receiver. Container smoke tests explicitly use one worker replica.
+
+- **Step 5 error policy:** Network errors, timeouts, HTTP `429`, and `500`–`599` are temporary. Other non-2xx responses, including redirects, `400`, and `401`, fail immediately. A successful third attempt is delivered; an unsuccessful third attempt is failed. Existing database constraints continue to limit counters and history attempt numbers to three.
+- **Step 5 backoff:** `retry_delay()` uses `max(2 ** (attempt - 1), retry_after_seconds)`: one second after attempt 1 and two seconds after attempt 2, or longer when required by `Retry-After`. `parse_retry_after()` accepts non-negative integer seconds; absent or malformed values fall back to exponential backoff. HTTP-date headers are outside this challenge's seconds-only contract.
+- **Step 5 deadline:** `deliver()` uses an HTTPX asynchronous client and a five-second `asyncio.wait_for` deadline around the entire HTTP request, in addition to HTTPX phase timeouts. Timeout outcomes have a null HTTP status and a descriptive error. Events are still delivered sequentially by one worker; asynchronous HTTP is used for the deadline, not multiple-event concurrency.
+- **Step 5 persistence:** `record_attempt()` commits the history row, counter, status, and next due time together. Temporary failures below the limit remain `pending`; their due time is computed using PostgreSQL `clock_timestamp()` plus the delay after the response. Terminal outcomes clear the schedule. `fetch_pending()` selects only due pending events with fewer than three attempts, ordered by due time and ID. No per-event backoff sleep blocks other pending work.
+- **Step 5 restart scope:** A restarted worker reads the saved attempt count and due time instead of resetting them. Tests stop a worker only after its retry transaction commits, then start its replacement. Recovery of an in-flight HTTP delivery and multiple-worker coordination remain deferred to Step 6. Existing failed events are not automatically requeued by the migration.
 
 ## 4. Starting and Verifying the System
 
@@ -102,6 +111,40 @@ docker compose logs --tail 8 worker
 - The container running pytest overrides the worker command and does not run another delivery worker. One Compose delivery worker was left running. Continue using `--scale worker=1` until multiple-worker coordination is implemented; the default replica configuration was not changed.
 - `git diff --check` passed. API application code, schema, and Mock Receiver were unchanged in Step 4.
 
+**Step 5:** Stopped the Compose worker and ran the scoped regressions against isolated test databases and the unchanged receiver over real HTTP. The final command included added coverage for successful delivery on attempt 3:
+
+```powershell
+docker compose stop worker
+docker compose run --rm --no-deps -v "${PWD}:/workspace" -w /workspace -e PYTHONDONTWRITEBYTECODE=1 -e RELAYOPS_TEST_DATABASE_URL=postgresql://relayops:relayops@db:5432/relayops -e RELAYOPS_BASE_URL=http://gateway api sh -c 'pip install -q -r tests/requirements.txt && python -m pytest tests/test_models.py tests/test_api_unit.py tests/test_api_integration.py tests/test_api_http.py tests/test_worker_unit.py tests/test_worker_integration.py -q -ra --tb=short -p no:cacheprovider'
+```
+
+- **Regression result:** 118 passed in 36.45 seconds, exit code 0, no failures or skips. Includes all 49 API tests, 36 worker unit tests, and 33 worker integration tests. One third-party Starlette/AnyIO deprecation warning was reported.
+- Tests verify immediate success, temporary HTTP failures followed by success on attempt 2 or 3, permanent failures, connection refusal, timeouts, three-attempt exhaustion, exponential backoff, `Retry-After`, and processing another event before a scheduled retry is due. Step 4 tests were updated to expect scheduled retries for temporary failures instead of the former single-attempt terminal policy.
+- **Deadline verification:** Delayed the receiver response by 5.5 seconds and disabled the test client's HTTPX phase timeouts. The worker's five-second overall deadline fired and recorded a null HTTP code with a `TimeoutError`; the event remained pending for retry.
+- **Restart verification:** A subprocess worker received `503` with `Retry-After: 3` and committed attempt 1 plus its due time. After stopping that process, a replacement worker delivered attempt 2 with `200`. Assertions confirmed the saved due time was unchanged across restart and the second request arrived no earlier than that time or the three-second delay.
+
+Applied the additive migration once to the existing volume while the worker was stopped:
+
+```powershell
+docker compose exec -T db psql -U relayops -d relayops --single-transaction -v ON_ERROR_STOP=1 -f /docker-entrypoint-initdb.d/003_retry_schedule.sql
+docker compose build worker
+docker compose up -d --no-build --scale worker=1 worker
+```
+
+- Migration output was `ALTER TABLE`, `UPDATE 7`, and `CREATE INDEX`. Before/after count and checksum queries through `docker compose exec -T db psql -U relayops -d relayops -At` confirmed all original fields in 7 event rows and all 4 delivery-history rows were unchanged. The checksum excluded only the newly added `next_attempt_at` field. An isolated integration test also verified migration preserves existing event data and history.
+
+Ran the existing smoke tests against one Compose worker:
+
+```powershell
+docker compose run --rm --no-deps -v "${PWD}:/workspace" -w /workspace -e PYTHONDONTWRITEBYTECODE=1 -e RELAYOPS_BASE_URL=http://api:8000 -e RELAYOPS_RECEIVER_URL=http://receiver:9000 worker sh -c 'pip install -q -r tests/requirements.txt && python -m pytest tests/test_smoke.py -v -ra --tb=short -p no:cacheprovider'
+docker compose ps worker
+```
+
+- **Smoke result:** 2 passed in 1.14 seconds, exit code 0, no failures or skips. Compose showed exactly one delivery worker running.
+- **Live retry probe:** A Python script passed through stdin to `docker compose exec -T worker python -` configured receiver `/control` with `fail_next=2`, `status_code=503`, and `retry_after=2`, then created an event through the API. API history showed `503 → 503 → 200`, status delivered, and three attempts. Receiver capture verified valid signatures and retry gaps of 2.006 and 2.008 seconds, measured from the previous response to the next arrival.
+- **Live permanent failure:** The same probe configured one `400` response. The event became failed with one recorded attempt; receiver inspection after another polling interval showed no retry. Receiver control was reset afterward. `docker compose logs --tail 10 worker` confirmed these outcomes.
+- `git diff --check` passed. Only worker code, its two test modules, and the new retry migration changed during implementation. API application code, Mock Receiver, and `SOLUTION.md` were unchanged during Step 5 implementation; one worker replica was left running.
+
 ## 5. AI Tools Used
 
 - Used Codex to inspect configuration, reproduce networking failures, edit four configuration files, and run container DNS, HTTP, database, and restart checks. Verified changes against actual command output and reviewed the diff; `git diff --check` passed. No API or worker source functionality was changed.
@@ -110,5 +153,7 @@ docker compose logs --tail 8 worker
 - **Step 3 mistake:** Codex attempted the migration before stopping the old API. The migration blocked because that API held an idle GET transaction. `pg_stat_activity` identified the lock holder; stopping the API released it, and migration completed. The documented migration procedure now stops the API first.
 - **Step 4:** Codex implemented single-attempt worker delivery, exact-byte HMAC signing, response classification, transactional attempt recording, and worker tests. Verification combined all 49 API regressions with 30 worker tests against real PostgreSQL and the unchanged receiver over HTTP, followed by two container smoke tests with one worker replica.
 - **Step 4 mistake:** Codex constructed the test receiver URL by concatenating a base URL and `webhook` without a separating slash. The first combined run produced 17 failures and 62 passes; HTTPX reported an invalid port such as `34221webhook`. Replaced concatenation with `base_url.join("/webhook")`. The corrected combined suite passed all 79 tests, followed by both smoke tests.
+- **Step 5:** Codex implemented error classification, exponential backoff, seconds-based `Retry-After`, the total HTTP deadline, and transactional retry scheduling. It added unit and real-PostgreSQL/HTTP integration tests, applied the additive migration, and verified existing data using counts and checksums. Verification finished with 118 passing regressions, two passing container smoke tests, and live retry/permanent-failure probes using one worker.
+- **Step 5 verification:** Codex identified that the prior HTTPX phase timeout did not enforce a total five-second deadline and added a delayed-response test with phase timeouts disabled. No new implementation or test mistake was identified during Step 5.
 
 ## 6. Future Improvements
