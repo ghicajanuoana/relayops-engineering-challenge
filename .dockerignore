@@ -6,4 +6,5 @@
 **/*.pyc
 .pytest_cache
 test-results
+.startup-audit
 candidate

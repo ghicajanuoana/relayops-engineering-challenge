@@ -2,7 +2,9 @@ x-database-environment: &database-environment
   PGHOST: db
   PGPORT: "5432"
   PGUSER: ${POSTGRES_USER:-relayops}
-  PGPASSWORD: ${POSTGRES_PASSWORD:?Run python scripts/configure.py first}
+  PGPASSWORD: ${POSTGRES_PASSWORD:-}
+  PGPASSFILE: /run/relayops-db/pgpass
+  RELAYOPS_DATABASE_PASSWORD_FILE: /run/relayops-db/password
   PGDATABASE: ${POSTGRES_DB:-relayops}
 
 x-logging: &logging
@@ -12,6 +14,19 @@ x-logging: &logging
     max-file: "3"
 
 services:
+  bootstrap:
+    image: python:3.12-slim@sha256:12316debbfb86890f6b2d825820612741ba527ad5a44e3902759141d572bfe8f
+    network_mode: none
+    logging: *logging
+    command: ["python", "/bootstrap_secrets.py"]
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-}
+      WEBHOOK_SECRET: ${WEBHOOK_SECRET:-}
+    volumes:
+      - ./scripts/bootstrap_secrets.py:/bootstrap_secrets.py:ro
+      - database_credentials:/run/relayops-db
+      - webhook_credentials:/run/relayops-webhook
+
   gateway:
     image: nginx:1.27-alpine@sha256:65645c7bb6a0661892a8b03b89d0743208a18dd2f3f17a54ef4b76fb8e2f2a10
     restart: unless-stopped
@@ -36,6 +51,11 @@ services:
     build: ./api
     restart: unless-stopped
     logging: *logging
+    entrypoint: ["/bin/sh", "/runtime-entrypoint.sh"]
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--no-access-log", "--log-config", "logging.json"]
+    volumes:
+      - ./scripts/runtime-entrypoint.sh:/runtime-entrypoint.sh:ro
+      - database_credentials:/run/relayops-db:ro
     environment:
       <<: *database-environment
     healthcheck:
@@ -45,6 +65,8 @@ services:
       retries: 5
       start_period: 10s
     depends_on:
+      bootstrap:
+        condition: service_completed_successfully
       db:
         condition: service_healthy
     networks:
@@ -56,19 +78,28 @@ services:
     restart: unless-stopped
     stop_grace_period: 10s
     logging: *logging
+    entrypoint: ["/bin/sh", "/runtime-entrypoint.sh"]
+    command: ["python", "worker.py"]
+    volumes:
+      - ./scripts/runtime-entrypoint.sh:/runtime-entrypoint.sh:ro
+      - database_credentials:/run/relayops-db:ro
+      - webhook_credentials:/run/relayops-webhook:ro
     environment:
       <<: *database-environment
       RECEIVER_URL: ${RECEIVER_URL:-http://receiver:9000/webhook}
-      WEBHOOK_SECRET: ${WEBHOOK_SECRET:?Run python scripts/configure.py first}
+      WEBHOOK_SECRET: ${WEBHOOK_SECRET:-}
+      RELAYOPS_WEBHOOK_SECRET_FILE: /run/relayops-webhook/secret
       POLL_INTERVAL: ${POLL_INTERVAL:-1}
       BATCH_SIZE: ${BATCH_SIZE:-10}
     healthcheck:
-      test: ["CMD", "python", "-c", "import worker; worker.check_health()"]
+      test: ["CMD", "/bin/sh", "/runtime-entrypoint.sh", "python", "-c", "import worker; worker.check_health()"]
       interval: 5s
       timeout: 6s
       retries: 3
       start_period: 10s
     depends_on:
+      bootstrap:
+        condition: service_completed_successfully
       db:
         condition: service_healthy
       receiver:
@@ -83,8 +114,17 @@ services:
     build: ./receiver
     restart: unless-stopped
     logging: *logging
+    entrypoint: ["/bin/sh", "/runtime-entrypoint.sh"]
+    command: ["uvicorn", "receiver:app", "--host", "0.0.0.0", "--port", "9000", "--no-access-log"]
+    volumes:
+      - ./scripts/runtime-entrypoint.sh:/runtime-entrypoint.sh:ro
+      - webhook_credentials:/run/relayops-webhook:ro
+    depends_on:
+      bootstrap:
+        condition: service_completed_successfully
     environment:
-      WEBHOOK_SECRET: ${WEBHOOK_SECRET:?Run python scripts/configure.py first}
+      WEBHOOK_SECRET: ${WEBHOOK_SECRET:-}
+      RELAYOPS_WEBHOOK_SECRET_FILE: /run/relayops-webhook/secret
     ports:
       - "${RECEIVER_PORT:-9000}:9000"
     healthcheck:
@@ -100,10 +140,15 @@ services:
     image: postgres:16-alpine@sha256:0cefaabd882e42bcb2a2f3dc56d3ce4770560ba62fd7f197f1a2e008fd5731ab
     restart: unless-stopped
     logging: *logging
-    command: ["postgres", "-c", "hba_file=/etc/postgresql/pg_hba.conf"]
+    entrypoint: ["/bin/sh", "/runtime-entrypoint.sh"]
+    command: ["docker-entrypoint.sh", "postgres", "-c", "hba_file=/etc/postgresql/pg_hba.conf"]
+    depends_on:
+      bootstrap:
+        condition: service_completed_successfully
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-relayops}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Run python scripts/configure.py first}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-}
+      RELAYOPS_DATABASE_PASSWORD_FILE: /run/relayops-db/password
       POSTGRES_DB: ${POSTGRES_DB:-relayops}
       POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256
     healthcheck:
@@ -112,6 +157,8 @@ services:
       timeout: 3s
       retries: 15
     volumes:
+      - ./scripts/runtime-entrypoint.sh:/runtime-entrypoint.sh:ro
+      - database_credentials:/run/relayops-db:ro
       - pgdata:/var/lib/postgresql/data
       - ./db:/docker-entrypoint-initdb.d:ro
       - ./infrastructure/pg_hba.conf:/etc/postgresql/pg_hba.conf:ro
@@ -123,14 +170,22 @@ services:
     build:
       context: .
       dockerfile: tests/Dockerfile
+    entrypoint: ["/bin/sh", "/runtime-entrypoint.sh", "python", "tests/run_tests.py"]
+    command: ["regression"]
     environment:
       <<: *database-environment
-      WEBHOOK_SECRET: ${WEBHOOK_SECRET:?Run python scripts/configure.py first}
+      WEBHOOK_SECRET: ${WEBHOOK_SECRET:-}
+      RELAYOPS_WEBHOOK_SECRET_FILE: /run/relayops-webhook/secret
       RELAYOPS_BASE_URL: http://gateway
       RELAYOPS_RECEIVER_URL: http://receiver:9000
     volumes:
+      - ./scripts/runtime-entrypoint.sh:/runtime-entrypoint.sh:ro
+      - database_credentials:/run/relayops-db:ro
+      - webhook_credentials:/run/relayops-webhook:ro
       - ./test-results:/test-results
     depends_on:
+      bootstrap:
+        condition: service_completed_successfully
       db:
         condition: service_healthy
       api:
@@ -151,3 +206,5 @@ networks:
 
 volumes:
   pgdata:
+  database_credentials:
+  webhook_credentials:

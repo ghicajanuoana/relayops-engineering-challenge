@@ -1,8 +1,8 @@
 # RelayOps — Engineering Challenge
 
 > Implemented startup, upgrade, secrets, health checks, and CI/test procedures:
-> [Operations guide](docs/OPERATIONS.md). Run `python scripts/configure.py` before
-> the first `docker compose up --build` to create private local configuration.
+> [Operations guide](docs/OPERATIONS.md). `docker compose up --build` generates
+> private persistent credentials automatically; no `.env` or host Python is required.
 
 **Senior · Software Engineering · Networking · DevOps · AI**
 

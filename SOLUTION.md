@@ -2,6 +2,8 @@
 
 Steps 2–8 below retain their verified results and limitations at the time of each step. Step 9 records the final state and supersedes historical statements that hosted CI was unverified or later functionality was deferred.
 
+The fresh-install correction below supersedes earlier statements that startup requires `.env` or manual configuration. The current startup command is `docker compose up --build`; credentials are initialized automatically inside Compose.
+
 ## 1. Identified Problems and Solutions
 
 | # | Component | Symptom | Cause | Solution |
@@ -37,6 +39,8 @@ Steps 2–8 below retain their verified results and limitations at the time of e
 
 | 29 | Payload Unicode validation | Step 9 reproduced `500` through the gateway for an unpaired Unicode surrogate in a nested payload. | JSON serialization escaped the invalid scalar, allowing it past validation into PostgreSQL JSONB handling. | `api/app/models.py` validates UTF-8 encoding before database access; malformed payloads return `422`. `tests/test_api_unit.py` adds three invalid cases; `tests/test_api_http.py` verifies valid surrogate pairs and literal escape strings remain accepted. |
 
+| 30 | Fresh-install startup | An empty-environment Compose audit reproduced exit `1` before build/start when `.env` was absent. | Required `${POSTGRES_PASSWORD:?...}` / `${WEBHOOK_SECRET:?...}` interpolation depended on a manual host script; earlier CI ran that script and concealed the evaluator startup gap. | `docker-compose.yml` adds a network-isolated one-shot bootstrap with persistent credential volumes and dependency gating. `scripts/bootstrap_secrets.py` generates/reuses private random credentials; `scripts/runtime-entrypoint.sh` loads them without changing application contracts. CI no longer runs manual configuration. |
+
 ## 2. Networking Diagnosis
 
 - Inspected Compose, its automatically loaded override, Dockerfiles, and Nginx configuration. Existing shared networks and service ports matched the intended communication paths; no network topology changes were needed.
@@ -71,6 +75,8 @@ docker compose logs --since 3m api gateway | Select-String -Pattern 'step7-provi
 ```
 
 **Step 9:** `docker compose config --quiet` and `docker compose exec -T gateway nginx -t` passed. Python `socket.gethostbyname()` / `socket.create_connection(..., 3)` probes run with `docker compose exec -T api python -c ...` and `docker compose exec -T --index 1 worker python -c ...` confirmed API→`db:5432` and worker→`db:5432` / `receiver:9000` DNS and TCP access. Database DNS resolved to `172.20.0.2`; receiver resolved to `172.19.0.2`. `docker inspect relayops-engineering-challenge-db-1 --format '{{json .NetworkSettings.Ports}}'` returned `{"5432/tcp":null}`, confirming no host publication. `docker compose ps` showed all six runtime containers healthy, including two workers. The regression suite reverified the 1 MiB payload round trip, request IDs, health, metrics, and network isolation.
+
+**Fresh-install correction:** The audit used an empty environment file (`docker compose --env-file NUL config --quiet` on Windows, invoked from Python with required secret variables removed). Before the fix, missing both secrets or just HMAC configuration returned exit `1`; supplying both allowed configuration validation. After the fix, the isolated no-`.env` configuration passed. PostgreSQL still uses the mounted SCRAM-SHA-256 TCP rules and has no published host port; runtime inspection returned `{"5432/tcp":null}`. An independent API-container Python process authenticated using generated `PGPASSFILE`, confirming health/exec processes do not depend on environment exported by PID 1.
 
 ## 3. Technical Decisions
 
@@ -116,6 +122,10 @@ docker compose logs --since 3m api gateway | Select-String -Pattern 'step7-provi
 **Step 9:** Reject unpaired Unicode surrogates before database access while retaining valid Unicode and literal backslash escapes. No API response shapes or receiver contract changed. Strengthened the existing smoke test to require a valid signature, matching webhook body, HTTP `200`, and committed delivery history; it waits for both receipt and committed status to avoid observing the interval between HTTP acceptance and database commit.
 
 Final operational limits remain explicit: initial startup requires private configuration; old volumes need any missing numbered migrations applied once. In-flight delivery holds a database transaction/row lock, so the committed `processing` gauge normally remains zero. A crash after remote acceptance can cause a duplicate; the three-attempt limit counts committed history, not uncommitted HTTP calls. Docker health status alone does not restart an unhealthy process.
+
+**Fresh-install correction:** Compose runs the pinned Python image once, with no network access, before credential-dependent services. Random database/HMAC values persist separately in `database_credentials` and `webhook_credentials`; existing non-empty `.env`/shell overrides take precedence. Bootstrap reuses saved values, writes files atomically with `0600` permissions inside `0700` directories, and prints no secrets. Application mounts are read-only; receiver receives only the HMAC volume. No password or key is committed.
+
+The shared shell entrypoint exports required values then uses `exec`, preserving direct SIGTERM delivery. API health/exec connections use a private libpq password file; worker health probes use the entrypoint. `.gitattributes` enforces LF for shell scripts on Windows checkouts. Existing database roles/data and `.env` are not rewritten; password rotation remains explicit maintenance through the optional `scripts/configure.py`. Back up credential volumes with database data. Losing credentials for an old database is not silently repaired by reinitializing data. CI now tests automatic initialization rather than creating `.env` first.
 
 ## 4. Starting and Verifying the System
 
@@ -356,6 +366,28 @@ Final challenge checklist:
 | Technical report, AI usage, future improvements | Completed in these six sections. |
 | Submission CV and final fork/commit link | Pending user submission: `candidate/CV.pdf` is absent; final changes must be committed/pushed and the final link supplied. |
 
+**Fresh-install correction — executed verification:** Copied current tracked source plus new bootstrap/test files into ignored `.startup-audit/fresh`, without `.env` or private files. Used a new Compose project (`fresh`) and new project-scoped volumes. A temporary Python launcher removed inherited database/HMAC/project/URL settings and set only published ports `18080`/`19000` to avoid collisions. The actual first startup subprocess was exactly `docker compose up --build`; it did not call `configure.py`. Bootstrap exited `0`, and all six runtime containers, including two workers, became healthy. No host Python is required by the application; Python was only the local isolation/verification harness.
+
+Executed inside that isolated project:
+
+```bash
+docker compose config --quiet
+docker compose up --build
+# Subsequent verification, with both workers stopped for regressions:
+docker compose stop worker
+docker compose --profile test run --build --rm tests regression
+docker compose up --build -d --wait --wait-timeout 120 worker
+docker compose --profile test run --rm tests smoke
+docker compose down
+docker compose up --build -d --wait --wait-timeout 120
+docker compose --profile test run --rm tests smoke
+```
+
+- **175 regressions passed, 0 failed/skipped**, 60.97 seconds; one existing third-party deprecation warning. Five new tests cover private/random/persistent generation, explicit configuration and password-file escaping, entrypoint precedence/file loading, and missing-file failure. Both smoke tests passed before restart (**2 passed**, 0.60 seconds) and after restart (**2 passed**, 1.11 seconds).
+- A separate live POST returned `202`; the event became delivered with one HTTP `200` history row and one matching receiver record with `signature_valid=true`. After isolated `down`/`up` without `-v`, saved event/history checksums and both credential fingerprints were unchanged. `.env` remained absent throughout. Existing authentication, HMAC, retries, concurrency, and recovery tests passed in the full regression suite.
+- Existing installation: started its stopped database to record a baseline, then ran `docker compose up --build -d --wait --wait-timeout 120`. The original `pgdata` volume was retained; **31 event rows and 34 history rows** had identical complete-row checksums before/after. Existing `.env` SHA-256 was unchanged. All runtime services were healthy.
+- Captured isolated-project logs contained neither generated secret. A tracked/proposed-source scan found no active generated/configured secret values or private `.env` files. The temporary audit directory is ignored by Git and Docker builds. No database/credential volumes were deleted. The revised CI workflow still requires a new GitHub run after commit/push; the earlier successful run does not cover this correction.
+
 ## 5. AI Tools Used
 
 - Used Codex to inspect configuration, reproduce networking failures, edit four configuration files, and run container DNS, HTTP, database, and restart checks. Verified changes against actual command output and reviewed the diff; `git diff --check` passed. No API or worker source functionality was changed.
@@ -378,6 +410,8 @@ Final challenge checklist:
 - **Step 9:** Codex reviewed the README contracts, reran all automated tests, inspected the actual GitHub run/jobs/logs, checked tracked files for active secrets, and exercised the live gateway/receiver with two workers. It fixed only the reproduced Unicode validation gap and strengthened existing smoke assertions; `docs/OPERATIONS.md` now records confirmed hosted CI with its commit scope. Verification used 170 passing regressions, two passing smoke tests, live retry/HMAC/idempotency probes, and Docker diagnostics. The earlier validator's omission of unpaired surrogates was detected by a real `500` response and corrected with regression coverage.
 - **Step 9 diagnostic mistake:** A live-check script assigned an event dictionary to `concurrent`, shadowing the imported module and raising `AttributeError` before the concurrent-request probe. Codex changed the script to import `ThreadPoolExecutor` directly and reran the affected probe successfully. No application change was required for that mistake.
 
+- **Fresh-install correction:** Codex's earlier completion assessment incorrectly treated startup after manual configuration as meeting the evaluator's single-command requirement. The user's audit request exposed that gap; an empty-environment Compose check reproduced it. Codex implemented persistent automatic bootstrap, preserved existing configuration/data, added five tests, and verified no-`.env` startup, 175 passing regressions, four smoke-test executions, signed delivery, and restart persistence in isolation. No API or Mock Receiver contract was changed.
+
 ## 6. Future Improvements
 
 - Add versioned migration tracking and automated upgrade checks so existing volumes do not require manual selection of missing SQL files.
@@ -387,3 +421,4 @@ Final challenge checklist:
 - Add a dependency/image vulnerability scan and an automated, reviewed update process for pinned locks/digests. Resolve the upstream test deprecation warning during compatible dependency updates.
 - Add longer fault/soak tests for database/network outages and container replacement, including gateway DNS refresh after an API address changes. Define retention/archival for event/history tables and receiver diagnostic records as data volume grows.
 - Document receiver-side deduplication for real integrations: at-least-once delivery intentionally permits duplicates after a crash between remote acceptance and local commit.
+- Automate encrypted backup/restore verification for database and credential volumes together; current documentation requires preserving both, but backup automation is not implemented.

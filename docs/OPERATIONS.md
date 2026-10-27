@@ -1,23 +1,30 @@
 # Running and verifying RelayOps
 
-Requirements: Docker with Compose v2 and Python 3 for one-time configuration.
+Requirements: Docker with Compose v2. Host Python is not required for startup.
 The runtime and tests use pinned Linux images and Python dependency locks.
 
 ## First startup or upgrade of an existing installation
 
 ```bash
-python scripts/configure.py
-docker compose config --quiet
 docker compose up --build
 ```
 
-Configuration generates private `.env` secrets and preserves an existing `.env`.
-For an existing Compose database, it retains its user/database names and updates
-the role password through the database container's local maintenance socket.
-It never deletes tables or volumes. Stop application traffic during an upgrade:
-changing the role password requires restarting API and worker containers with
-the updated environment. Rerunning configuration synchronizes the password again.
-Use the same `COMPOSE_PROJECT_NAME` when managing a custom project.
+A one-shot `bootstrap` service creates random database and HMAC credentials in
+project-scoped `database_credentials` and `webhook_credentials` Docker volumes.
+It has no network access and never prints secret values. Files/directories use
+permissions `0600`/`0700`; application mounts are read-only. Subsequent starts reuse
+the credentials. The runtime entrypoint loads them and uses `exec` so workers
+still receive SIGTERM directly. Independent API health probes use a private
+libpq password file; worker probes use the same entrypoint as the worker.
+
+Existing `.env`/shell configuration takes precedence and is retained. Existing
+database data is not reinitialized, and bootstrap does not change database roles.
+Keep the same database user/name/password and Compose project when upgrading.
+Changing a configured password alone does not change an existing PostgreSQL role:
+the optional `python scripts/configure.py` maintenance tool can synchronize that
+role through its local socket. It is not needed for fresh startup or normal restarts.
+Back up the credential volumes together with `pgdata`; do not delete either to
+upgrade. Lost credentials for an old database require explicit maintenance.
 
 PostgreSQL TCP authentication uses SCRAM-SHA-256 on both new and existing volumes.
 Local Unix-socket maintenance stays trusted inside the database container.
@@ -32,7 +39,9 @@ Defaults: gateway `http://localhost:8080`, receiver `http://localhost:9000`.
 `RECEIVER_URL`, `POLL_INTERVAL`, and `BATCH_SIZE` configure the services.
 Applications use libpq `PG*` variables, avoiding URL escaping for passwords;
 explicit `DATABASE_URL` remains supported for external callers/tests.
-The worker and receiver always receive the same configured HMAC key.
+The worker and receiver receive the same configured or generated HMAC key.
+`.env.example` contains optional overrides; leaving secrets blank selects the
+persisted generated credentials. Do not use `POSTGRES_HOST_AUTH_METHOD=trust`.
 
 `up --build` starts two workers. For an automated readiness wait:
 
@@ -63,13 +72,15 @@ Keep Compose workers stopped during this phase so they do not change live API
 test events. Smoke tests then exercise the full stack with both workers running.
 The test runner returns pytest's exit code and writes `test-results/*.xml`.
 
-GitHub Actions runs these phases on pushes and pull requests with generated,
-isolated credentials, health-gated startup, failure logs, JUnit artifact upload,
+GitHub Actions runs these phases on pushes, pull requests, and manual dispatch with
+Compose-generated isolated credentials, health-gated startup, failure logs, JUnit artifact upload,
 and unconditional container cleanup. It needs no repository secrets or cloud
 account. Push-triggered CI, checkout, regression/smoke gates, artifact upload, and
 cleanup succeeded in [run 40532562527](https://github.com/ghicajanuoana/relayops-engineering-challenge/actions/runs/40532562527)
-for commit `96c16b8`. Run CI again after committing later changes; manual dispatch
-is configured but has not been exercised during this verification.
+for commit `96c16b8` using the earlier explicit-configuration startup. The workflow
+now exercises automatic bootstrap without running `configure.py`; this revised
+workflow still needs a new hosted run after commit/push. Manual dispatch has not
+been exercised during this verification.
 
 ## Troubleshooting and data preservation
 
@@ -80,9 +91,9 @@ docker compose down
 docker compose up --build --wait --wait-timeout 120
 ```
 
-`down` retains the database volume. Never use `down -v` to upgrade this project.
-For a stopped database, configuration starts its existing container before
-synchronizing the role password. If existing data predates the API/retry schema,
+`down` retains database and credential volumes. Never use `down -v` to upgrade.
+For explicit password maintenance, the optional configuration script starts a
+stopped database before synchronizing its role. If existing data predates the API/retry schema,
 apply only the missing SQL migrations once with `psql --single-transaction`;
 initialization scripts run automatically only on a new volume.
 
